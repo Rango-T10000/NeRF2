@@ -22,8 +22,8 @@ train:
   T_max: 10000
   eta_min: 1e-6
   batch_size: 8192
-  total_iterations: 30000
-  load_ckpt: True
+  total_iterations: 80000 # 30000
+  load_ckpt: True   #要是想重开不接着之前的训练就这里给False
 
   save_freq: 100
   val_freq: 2500

@@ -78,60 +78,65 @@ class Renderer_spectrum(Renderer):
         """
 
         # sample points along rays
-        pts, t_vals = self.sample_points(rays_o, rays_d)
+        #每个points就是每天射线上经过的每个voxe: pts: [batchsize, n_points, 3]; t_vals: [batchsize, n_points]这个是每个点到原点的距离
+        pts, t_vals = self.sample_points(rays_o, rays_d) 
 
         # Expand views and tx to match the shape of pts
-        view = rays_d[:, None].expand(pts.shape)
-        tx = tx[:, None].expand(pts.shape)
+        view = rays_d[:, None].expand(pts.shape) # [batchsize, n_points, 3],这个就是每个点的方向,就是文章中的w，因为一个ray上的所有点的方向都是一样的，所以直接相当于复制了n_points次作为每个点的w
+        tx = tx[:, None].expand(pts.shape)       # [batchsize, n_points, 3]
 
         # Run network and compute outputs
-        raw = self.network_fn(pts, view, tx)    # [batchsize, n_samples, 4]
+        raw = self.network_fn(pts, view, tx)    # [batchsize, n_samples, 4]: 即attn_amp, attn_phase, signal_amp, signal_phase
         receive_ss = self.raw2outputs(raw, t_vals, rays_d)  # [batchsize]
 
         return receive_ss
 
 
-
+    #将模型的原始预测转换为最终的接收到的信号输出，就是收到的信号是所有ray上的信号的叠加
     def raw2outputs(self, raw, r_vals, rays_d):
         """Transforms model's predictions to semantically meaningful values. (core part)
 
         Parameters
         ----------
-        raw : [batchsize, n_samples, 4]. Prediction from model.
-        r_vals : [batchsize, n_samples]. Integration distance.
+        raw : [batchsize, n_samples, 4]. Prediction from model. 即attn_amp, attn_phase, signal_amp, signal_phase
+        r_vals : [batchsize, n_samples]. Integration distance.  [batchsize, n_points]这个是每个点到原点的距离
         rays_d : [batchsize, 3]. Direction of each ray
 
         Return:
         ----------
         receive_signal : [batchsize]. abs(singal of each ray)
         """
-
-        raw2alpha = lambda raw, dists: 1.-torch.exp(-raw*dists)
+        #定义幅度衰减和相位翻转的计算函数
+        raw2alpha = lambda raw, dists: 1.-torch.exp(-raw*dists) #这里没问题，下面计算att_i的时候用1减回去了；cv里面alpha是是1-exp(-density),这个density是在RF里面就是attenuation
         # raw2phase = lambda raw, dists: torch.exp(1j*raw*dists)
         raw2phase = lambda raw, dists: raw*dists
 
-        dists = r_vals[...,1:] - r_vals[...,:-1]
+        #计算采样点间的距离 dists: [batchsize, n_samples],其实这里面已经包含了场景中的最大距离D的信息
+        dists = r_vals[...,1:] - r_vals[...,:-1] #计算相邻采样点的间距
         dists = torch.cat([dists, torch.Tensor([1e10]).cuda().expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
         dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
         att_a, att_p, s_a, s_p = raw[...,0], raw[...,1], raw[...,2], raw[...,3]    # [N_rays, N_samples]
-        att_p, s_p = torch.sigmoid(att_p)*np.pi*2, torch.sigmoid(s_p)*np.pi*2
-        att_a, s_a = abs(F.leaky_relu(att_a)), abs(F.leaky_relu(s_a))
+        att_p, s_p = torch.sigmoid(att_p)*np.pi*2, torch.sigmoid(s_p)*np.pi*2      #将预测的值映射到0-2pi：过一个sigmoid乘以2pi
+        att_a, s_a = abs(F.leaky_relu(att_a)), abs(F.leaky_relu(s_a))              #将预测的值映射到0-正无穷，其实output head没过激活函数，所以这里过一下
         # att_a, s_a = torch.sigmoid(att_a), torch.sigmoid(s_a)
 
-        alpha = raw2alpha(att_a, dists)  # [N_rays, N_samples]
-        phase = raw2phase(att_p, dists)
+        alpha = raw2alpha(att_a, dists)  # [N_rays, N_samples] 计算每个ray上每个点的幅度衰减
+        phase = raw2phase(att_p, dists)  # [N_rays, N_samples] 计算每个ray上每个点的相位翻转
 
-        att_i = torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)).cuda(), 1.-alpha + 1e-10], -1), -1)[:, :-1]
-        path = torch.cat([r_vals[...,1:], torch.Tensor([1e10]).cuda().expand(r_vals[...,:1].shape)], -1)
-        path_loss = 0.025 / path
+        #把每个点当成新的tx,其射出的ray在途径的点上会累积衰减，计算每个ray上的每个点累积后的的幅度衰减和相位翻转；
+        #即公式中对attenuation从0～r的积分,每个ray上的每个点都有自己的r,即到rx的距离
+        #这里计算了：1. att_i和phase_i分别是每个ray上每个点材质造成的幅度衰减和相位翻转的累积值；2. path_loss是每个ray上每个点到rx的距离造成的衰减
+        att_i = torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)).cuda(), 1.-alpha + 1e-10], -1), -1)[:, :-1] # [N_rays, N_samples]  #这里1 - alpha就是我们要的attenuation
+        path = torch.cat([r_vals[...,1:], torch.Tensor([1e10]).cuda().expand(r_vals[...,:1].shape)], -1)             # [N_rays, N_samples]
+        path_loss = 0.025 / path #根据free spce loss公式计算的920MHz就这个值，即lamda/(4*pi*d)
         # phase_i = torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), phase], -1), -1)[:, :-1]
         phase_i = torch.cumsum(torch.cat([torch.ones((alpha.shape[0], 1)).cuda(), phase], -1), -1)[:, :-1]
         phase_i = torch.exp(1j*phase_i)    # [N_rays, N_samples]
 
-
+        #每个ray上的所有点的信号强度叠加，得到一个ray上收到的信号，即公式中对signal从0～D的积分
         receive_signal = torch.sum(s_a*torch.exp(1j*s_p)*att_i*phase_i*path_loss, -1)  # [N_rays]
-        receive_signal = abs(receive_signal)
+        receive_signal = abs(receive_signal) #计算每个ray上的信号强度，这样就预测出了每个ray上的信号强度，即预测的空间谱每个pixel的值，因为一个空间谱可能包含90*360个ray，这个batchaize取得每个大，所以这里的输出是一个batchsize大小的ray，并不是全部的pixel
 
         return receive_signal
 
@@ -253,17 +258,17 @@ class Renderer_CSI(Renderer):
         rays_d : tensor. [batchsize, 9x36x3]. The direction of rays
         """
 
-        rays_d = rearrange(rays_d, 'b (v d) -> b v d', d=3)    # [bs, 9x36, 3]
+        rays_d = rearrange(rays_d, 'b (v d) -> b v d', d=3)    # [bs, 9x36 x 3]--->[bs, 9x36, 3]
         batchsize, viewsize, _ = rays_d.shape
-        rays_o = repeat(rays_o, 'b d -> b v d', v=viewsize) #[bs, 9x36, 3]
-        uplink = repeat(uplink, 'b d -> b v d', v=viewsize)        #[bs, 9x36, 52]
+        rays_o = repeat(rays_o, 'b d -> b v d', v=viewsize)    #[bs, 3]--->[bs, 9x36, 3]
+        uplink = repeat(uplink, 'b d -> b v d', v=viewsize)    #[bs, 52]--->[bs, 9x36, 52]
 
-        pts, t_vals = self.sample_points(rays_o, rays_d) # [bs, 9x36, pts, 3]
+        pts, t_vals = self.sample_points(rays_o, rays_d) # pts: [bs, 9x36, pts, 3]; t_vals: [bs, 9x36, pts]
         views = repeat(rays_d, 'b v d -> b v p d', p=self.n_samples)  # [bs, 9x36, pts, 3]
-        uplink = repeat(uplink, 'b v d -> b v p d', p=self.n_samples)  # [bs, cks, pts, 3]
+        uplink = repeat(uplink, 'b v d -> b v p d', p=self.n_samples)  # [bs, 9x36, pts, 3]
 
-        # Run network and compute outputs
-        raw = self.network_fn(pts, views, uplink)    # [batchsize, 9x36, pts, 4]
+        # Run network and compute outputs; 为啥这里把uplink当作tx的位置输入给模型？:就当作是后面那个Radiacne Network的输入改了，用uplink的csi作为输入，输出是downlink的csi
+        raw = self.network_fn(pts, views, uplink)    # [batchsize, 9x36, pts, 104]
         recv_signal = self.raw2outputs_signal(raw, t_vals, rays_d)  # [bs, 26]
 
         return recv_signal
@@ -274,40 +279,40 @@ class Renderer_CSI(Renderer):
 
         Parameters
         ----------
-        raw : [batchsize, chunks,n_samples,  4]. Prediction from model.
-        r_vals : [batchsize, chunks, n_samples]. Integration distance.
-        rays_d : [batchsize,chunks, 3]. Direction of each ray
+        raw : [batchsize, chunks,n_samples,  attn_output_dims+sig_output_dims]. Prediction from model.
+        r_vals : [batchsize, chunks:36*9, n_samples]. Integration distance.
+        rays_d : [batchsize,chunks:36*9, 3]. Direction of each ray
 
         Return:
         ----------
         receive_signal : [batchsize, 26]. OFDM singal of each ray
         """
-        wavelength = sc.c / 2.4e9
+        wavelength = sc.c / 2.4e9  #sc.c是光速，sc是开头引入的一个python的物理常数库
         # raw2alpha = lambda raw, dists: 1.-torch.exp(-raw*dists)
         # raw2phase = lambda raw, dists: torch.exp(1j*raw*dists)
-        raw2phase = lambda raw, dists: raw + 2*np.pi*dists/wavelength
-        raw2amp = lambda raw, dists: -raw*dists
+        raw2phase = lambda raw, dists: raw + 2*np.pi*dists/wavelength  #模型预测的相位偏差 + 距离引起的相位偏差  = att_p + 2*pi*d/wavelength
+        raw2amp = lambda raw, dists: -raw*dists                        #模型预测的幅度衰减 - att_a*d
 
-        dists = r_vals[...,1:] - r_vals[...,:-1]
-        dists = torch.cat([dists, torch.Tensor([1e10]).cuda().expand(dists[...,:1].shape)], -1)  # [batchsize, chunks, n_samples]
-        dists = dists * torch.norm(rays_d[...,None,:], dim=-1)  # [batchsize,chunks, n_samples, 3].
+        dists = r_vals[...,1:] - r_vals[...,:-1] #[batchsize, chunks:36*9, n_samples/points-1]
+        dists = torch.cat([dists, torch.Tensor([1e10]).cuda().expand(dists[...,:1].shape)], -1)  # [batchsize, chunks, n_samples/points]
+        dists = dists * torch.norm(rays_d[...,None,:], dim=-1)  # [batchsize, chunks, n_samples/points].
 
-        att_a, att_p, s_a, s_p = raw[...,:26], raw[...,26:52], raw[...,52:78], raw[...,78:104]    # [batchsize,chunks, N_samples]
-        att_p, s_p = torch.sigmoid(att_p)*np.pi*2-np.pi, torch.sigmoid(s_p)*np.pi*2-np.pi
+        att_a, att_p, s_a, s_p = raw[...,:26], raw[...,26:52], raw[...,52:78], raw[...,78:104]    # [batchsize,chunks:36*9,n_samples, 26]
+        att_p, s_p = torch.sigmoid(att_p)*np.pi*2-np.pi, torch.sigmoid(s_p)*np.pi*2-np.pi          #将预测的值映射到-pi~pi：过一个sigmoid乘以2pi,再减去pi
         att_a, s_a = abs(F.leaky_relu(att_a)), abs(F.leaky_relu(s_a))
 
-        dists = dists.unsqueeze(-1)
+        dists = dists.unsqueeze(-1) #[batchsize, chunks:36*9, n_samples/points, 1]
 
-        amp = raw2amp(att_a, dists)  # [batchsize,chunks, N_samples, 26]
-        phase = raw2phase(att_p, dists)
+        amp = raw2amp(att_a, dists)     #[batchsize, chunks, n_samples/points, 26]
+        phase = raw2phase(att_p, dists) #[batchsize, chunks, n_samples/points, 26]
 
         # att_i = torch.cumprod(torch.cat([torch.ones((al_shape[:-1], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
         # phase_i = torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), phase], -1), -1)[:, :-1]
-        amp_i = torch.exp(torch.cumsum(amp, -2))            # [batchsize,chunks, N_samples, 26]
-        phase_i = torch.exp(1j*torch.cumsum(phase, -2))                # [batchsize,chunks, N_samples 26]
+        amp_i = torch.exp(torch.cumsum(amp, -2))            #[batchsize, chunks, n_samples/points, 26]
+        phase_i = torch.exp(1j*torch.cumsum(phase, -2))     #[batchsize, chunks, n_samples/points, 26]
 
         recv_signal = torch.sum(s_a*torch.exp(1j*s_p)*amp_i*phase_i, -2)  # integral along line [batchsize,chunks,26]
-        recv_signal = torch.sum(recv_signal, 1)   # integral along direction [batchsize, 26]
+        recv_signal = torch.sum(recv_signal, 1)                           # integral along direction [batchsize, 26]
 
         return recv_signal
 
@@ -315,3 +320,9 @@ class Renderer_CSI(Renderer):
 
 
 renderer_dict = {"spectrum": Renderer_spectrum, "rssi": Renderer_RSSI, "csi": Renderer_CSI}
+
+# 上面这3个类分别对应了3种不同的信号预测任务，分别是spectrum, rssi, csi，其实本质一样就是输入不同，输出都可预测一个复数（幅度+相位）
+# render以及叠加本质是一样的，都是对信号进行积分，但是输入的数据集不一样，所以预处理的代码不同
+# 还有就是raw2outputs_signal函数的输出，ss和rssi输出取abs，csi输出保留复数本身
+# 代码中csi的输出是26个OFDM信号，这个是因为CSI的数据集是26个OFDM信号，所以输出也是26个OFDM信号，即用uplink作为输入预测downlink，复数有幅度有相位
+# 代码中spectrum的输出是一个复数，即用tx作为输入预测rx，复数有幅度有相位，我可以用这个

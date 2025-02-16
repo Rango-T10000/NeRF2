@@ -22,3 +22,6 @@ dependencies:
       - einops
       - imageio
       - scikit-image
+# conda env create -f conda_env.yml
+# conda activate py38
+# error: libtorch_cpu.so: undefined symbol: iJIT_NotifyEvent -------->Solution:  conda install mkl=2024.0

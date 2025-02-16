@@ -153,12 +153,12 @@ class NeRF2(nn.Module):
         outputs: [batchsize, n_samples, 4].   attn_amp, attn_phase, signal_amp, signal_phase
         """
 
-        # position encoding
-        pts = self.embed_pts_fn(pts).contiguous()
+        # position encoding; #.contiguous() 是为了保证 Tensor 在内存中的连续性，方便 view() 操作
+        pts = self.embed_pts_fn(pts).contiguous() # [batchsize, n_samples/points, input_pts_dim], e.g.[batchsize, 64, 3]---->[batchsize, 64, 63]
         view = self.embed_view_fn(view).contiguous()
         tx = self.embed_tx_fn(tx).contiguous()
         shape = pts.shape
-        pts = pts.view(-1, list(pts.shape)[-1])
+        pts = pts.view(-1, list(pts.shape)[-1]) # [batchsize*n_samples, input_pts_dim]
         view = view.view(-1, list(view.shape)[-1])
         tx = tx.view(-1, list(tx.shape)[-1])
 
@@ -168,13 +168,13 @@ class NeRF2(nn.Module):
             if i in self.skips:
                 x = torch.cat([pts, x], -1)
 
-        attn = self.attenuation_output(x)    # (batch_size, 2)
-        feature = self.feature_layer(x)
+        attn = self.attenuation_output(x)    # (batch_size, 2); (batch_size, attn_output_dims),这个输出纬度根据数据集以及任务的不同在配置文件修改
+        feature = self.feature_layer(x)      # (batch_size, W); (batch_size, 256)
         x = torch.cat([feature, view, tx], -1)
 
         for i, layer in enumerate(self.signal_linears):
             x = F.relu(layer(x))
-        signal = self.signal_output(x)    #[batchsize, n_samples, 2]
+        signal = self.signal_output(x)    #[batchsize, n_samples, 2]; [batchsize*n_samples, sig_output_dims]这个输出纬度根据数据集以及任务的不同在配置文件修改
 
         outputs = torch.cat([attn, signal], -1).contiguous()    # [batchsize, n_samples, 4]
         return outputs.view(shape[:-1]+outputs.shape[-1:])
