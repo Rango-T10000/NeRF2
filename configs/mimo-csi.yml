@@ -9,8 +9,8 @@ path:
 ### rendering settings
 render:
   mode: 'csi'
-  near: 0
-  far: 5
+  near: 0     #在这里去规定场景的大小
+  far: 5      #在这里去规定场景的大小，这个就是最大5m范围，这就是文章中的D
   n_samples: 32
   scale_worldsize: 1
 

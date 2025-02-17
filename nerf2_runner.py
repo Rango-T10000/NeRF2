@@ -112,7 +112,6 @@ class NeRF2_Runner():
             self.current_iteration = ckpt['current_iteration']
 
 
-
     def save_checkpoint(self):
         ckptsdir = os.path.join(self.logdir, self.expname, 'ckpts')
         model_lst = [x for x in sorted(os.listdir(ckptsdir)) if x.endswith('.tar')]
@@ -135,7 +134,7 @@ class NeRF2_Runner():
         """
         self.logger.info("Start training. Current Iteration:%d", self.current_iteration)
         while self.current_iteration <= self.total_iterations:
-            with tqdm(total=len(self.train_iter), desc=f"Iteration {self.current_iteration}/{self.total_iterations}") as pbar:
+            with tqdm(total=len(self.train_iter), desc=f"Iteration {self.current_iteration}/{self.total_iterations}") as pbar: #显示进度条
                 for train_input, train_label in self.train_iter:
                     if self.current_iteration > self.total_iterations:
                         break
@@ -276,8 +275,6 @@ class NeRF2_Runner():
                                                                               'snr': snr.cpu().numpy()})
 
 
-
-
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -297,6 +294,7 @@ if __name__ == '__main__':
         logdir = os.path.join(kwargs['path']['logdir'], kwargs['path']['expname'])
         os.makedirs(logdir, exist_ok=True)
         copyfile(args.config, os.path.join(logdir,'config.yml'))
+
 
     worker = NeRF2_Runner(mode=args.mode, dataset_type=args.dataset_type, **kwargs)
     if args.mode == 'train':
