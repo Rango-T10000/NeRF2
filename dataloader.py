@@ -13,6 +13,8 @@ from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from einops import rearrange
+import json
+import torch.nn.functional as F
 
 
 
@@ -43,26 +45,31 @@ def amplitude2rssi(amplitude):
 def split_dataset(datadir, ratio=0.8, dataset_type='rfid'):
     """random shuffle train/test set
     """
-    if dataset_type == "rfid":
-        spectrum_dir = os.path.join(datadir, 'spectrum')
-        spt_names = sorted([f for f in os.listdir(spectrum_dir) if f.endswith('.png')])
-        index = [x.split('.')[0] for x in spt_names]
-        random.shuffle(index)
-    elif dataset_type == "ble":
-        rssi_dir = os.path.join(datadir, 'gateway_rssi.csv')
-        index = pd.read_csv(rssi_dir).index.values
-        random.shuffle(index)
-    elif dataset_type == "mimo":
-        csi_dir = os.path.join(datadir, 'csidata.npy')
-        index = [i for i in range(np.load(csi_dir).shape[0])]
-        random.shuffle(index)
+    if dataset_type == "fsc":
+        return
+    else:
+        if dataset_type == "rfid":
+            spectrum_dir = os.path.join(datadir, 'spectrum')
+            spt_names = sorted([f for f in os.listdir(spectrum_dir) if f.endswith('.png')])
+            index = [x.split('.')[0] for x in spt_names]
+            random.shuffle(index)
+        elif dataset_type == "ble":
+            rssi_dir = os.path.join(datadir, 'gateway_rssi.csv')
+            index = pd.read_csv(rssi_dir).index.values
+            random.shuffle(index)
+        elif dataset_type == "mimo":
+            csi_dir = os.path.join(datadir, 'csidata.npy')
+            index = [i for i in range(np.load(csi_dir).shape[0])]
+            random.shuffle(index)
+        elif dataset_type == "fsc":
+            csi_dir = os.path.join(datadir, 'combined_gnss_data.json')
 
-    train_len = int(len(index) * ratio)
-    train_index = np.array(index[:train_len])
-    test_index = np.array(index[train_len:])
+        train_len = int(len(index) * ratio)
+        train_index = np.array(index[:train_len])
+        test_index = np.array(index[train_len:])
 
-    np.savetxt(os.path.join(datadir, "train_index.txt"), train_index, fmt='%s')
-    np.savetxt(os.path.join(datadir, "test_index.txt"), test_index, fmt='%s')
+        np.savetxt(os.path.join(datadir, "train_index.txt"), train_index, fmt='%s')
+        np.savetxt(os.path.join(datadir, "test_index.txt"), test_index, fmt='%s')
 
 
 
@@ -164,9 +171,6 @@ class Spectrum_dataset(Dataset):
         return r_o, r_d.T
 
 
-
-
-
 class BLE_dataset(Dataset):
     """ble dataset class
     """
@@ -266,8 +270,6 @@ class BLE_dataset(Dataset):
         return self.nn_inputs[index], self.nn_labels[index]
 
 
-
-
 class CSI_dataset(Dataset):
 
     def __init__(self, datadir, indexdir, scale_worldsize=1):
@@ -303,11 +305,11 @@ class CSI_dataset(Dataset):
         self.nn_inputs, self.nn_labels = self.load_data()
 
 
-    def normalize_csi(self, csi):
+    def normalize_csi(self, csi): #训练的时候把input跟label都norm了，所以预测出的也是norm的结果，去跟norm后的label计算loss
         self.csi_max = torch.max(abs(csi))
         return csi / self.csi_max
 
-    def denormalize_csi(self, csi):
+    def denormalize_csi(self, csi): #推理的时候要知道预测的最终结果，那就需要denorm一下
         assert self.csi_max is not None, "Please normalize csi first"
         return csi * self.csi_max
 
@@ -318,13 +320,13 @@ class CSI_dataset(Dataset):
         Returns
         --------
         nn_inputs : tensor. [n_samples, 1027]. The inputs for training
-                    uplink: 52 (26 real; 26 imag), ray_o: 3, ray_d: 9x36x3, n_samples = n_dataset * n_bs
+                    uplink: 52 (26 real; 26 imag), ray_o: 3, ray_d: 9x36x3, n_samples = n_dataset * n_bs, 即4000条数据 * 8个天线 = 32000条数据
                     [n_samples, 1027] = [n_dataset * n_bs, 52+3+3*36*9]
                     其实nerf2的网络输入需要tx的位置,但是这里没有tx的位置,所以只有uplink的csi数据
 
         nn_labels : tensor. [n_samples, 52]. The downlink channels csi as labels
         """
-        ## NOTE! Large dataset may cause OOM?
+        ## NOTE! Large dataset may cause OOM?; 这里的len(self)是下面的__len__函数
         nn_inputs = torch.tensor(np.zeros((len(self), 52+3+3*self.alpha_res*self.beta_res)), dtype=torch.float32)
         nn_labels = torch.tensor(np.zeros((len(self), 52)), dtype=torch.float32)
 
@@ -334,7 +336,7 @@ class CSI_dataset(Dataset):
         bs_rays_d = rearrange(bs_rays_d, 'n g c -> n (g c)') # [n_bs, n_rays, 3] --> [n_bs, n_rays*3]
 
         ## Load data
-        for data_counter, idx in tqdm(enumerate(self.dataset_index), total=len(self.dataset_index)):
+        for data_counter, idx in tqdm(enumerate(self.dataset_index), total=len(self.dataset_index)): #这里的data_counter是数据集的索引, idx是self.dataset_index取出的内容
             bs_uplink = self.uplink[idx*self.n_bs: (idx+1)*self.n_bs]    # [n_bs, 52]
             bs_downlink = self.downlink[idx*self.n_bs: (idx+1)*self.n_bs]    # [n_bs, 52]
             nn_inputs[data_counter*self.n_bs: (data_counter+1)*self.n_bs] = torch.cat([bs_uplink, bs_ray_o, bs_rays_d], dim=-1) # [n_bs, 52+3+3*36*9]
@@ -371,8 +373,164 @@ class CSI_dataset(Dataset):
         return self.nn_inputs[index], self.nn_labels[index]
 
 
-    def __len__(self):
+    def __len__(self): #因为这里写了这个函数,所以调用len(self)的时候就会调用这个函数
         return len(self.dataset_index) * self.n_bs
 
 
-dataset_dict = {"rfid": Spectrum_dataset, "ble": BLE_dataset, "mimo": CSI_dataset}
+class fsc_dataset(Dataset):
+    def __init__(self, datadir, indexdir, scale_worldsize=1):
+        super().__init__()
+        self.datadir = datadir
+        self.csidata_dir = os.path.join(datadir, 'combined_gnss_data.json')
+        self.dataset_index = np.loadtxt(indexdir, dtype=int)
+        self.beta_res, self.alpha_res = 9, 36  # resolution of rays
+        
+        # 加载JSON数据
+        with open(self.csidata_dir, 'r') as file:
+            self.json_data = json.load(file)
+        
+        #按照索引值把train或test set先取出来
+        self.json_index_data = []
+        for idx in self.dataset_index:
+            self.json_index_data.append(self.json_data[idx])
+
+        #-------------提取所有rx_positions-------------
+        rx_positions_list = []
+        for data_item in self.json_index_data:
+            timestamp = list(data_item.keys())[0]
+            com_data = data_item[timestamp]
+            # 获取当前时间戳下所有的rx_pos
+            for com in com_data:
+                if com['rx_pos']:  # 确保tx_pos不为空
+                    rx_positions_list.append(com['rx_pos'])
+        # 转换为tensor
+        self.rx_pos = torch.tensor(rx_positions_list, dtype=torch.float32)  # shape: [4277, 3];理论是应该len = samples * 4个天线，但是在某些时间戳下有的天线没有数据
+
+        #-------------提取所有[tx_positions,carrier_phase,rss],对于tx数量不固定使用补0补成一样的，用同纬度mask值标记的方法-------------
+        tx_csi_list = []
+        for data_item in self.json_index_data:
+            timestamp = list(data_item.keys())[0]
+            com_data = data_item[timestamp]
+            # 获取当前时间戳下所有的rx_pos
+            for com in com_data:
+                tx_csi_for_one_rx_list = []
+                if com['rx_pos']:  # 确保tx_pos不为空
+                    for tx_csi in com['tx']:
+                        tx_csi_for_one_rx_list.append([tx_csi[i] for i in [1, 2, 3, 6, 7]])# [tx_x, tx_y, tx_z, carrier_phase, rss]
+                    tx_csi_list.append(tx_csi_for_one_rx_list)
+        # 找到第二层列表的最大长度和最小长度
+        self.max_tx_num = max(len(sublist) for sublist in tx_csi_list) #10
+        self.min_tx_num = min(len(sublist) for sublist in tx_csi_list) #1
+        # 初始化 mask 列表
+        tx_csi_mask_list = []
+        # 补齐不够的部分并生成 mask
+        for sublist in tx_csi_list:
+            mask = [1] * len(sublist)
+            while len(sublist) < self.max_tx_num:
+                sublist.append([0, 0, 0, 0, 0])  # 补齐0
+                mask.append(0)
+            tx_csi_mask_list.append(mask)
+        # 转换为 tensor
+        self.tx_csi = torch.tensor(tx_csi_list, dtype=torch.float32)  # shape: [4277, max_tx_num, 3+1+1]；[4277,10,5]
+        self.tx_csi_mask = torch.tensor(tx_csi_mask_list, dtype=torch.float32)  # shape: [4277, max_tx_num] 用于标记tx_csi的mask，即哪些是真实数据，哪些是补0的数据
+
+        #注意，这里的self.tx_csi_mask是用于标记tx_csi的mask，即原本有的数据我们标记为1，补0的数据我们标记为0
+        #这样在训练结束的时候我们可以根据这个mask来计算loss，不计算补0的数据的loss
+
+        self.rx_pos = self.rx_pos.unsqueeze(1).repeat(1, self.max_tx_num, 1) #[4277, max_tx_num, 3]；[4277,10,3]
+        self.tx_pos = self.tx_csi[...,:3]   #[4277, max_tx_num, 3]；[4277,10,3]
+        csi_data = self.tx_csi[...,3:] #[4277, max_tx_num, 1+1]；[4277,10,2] (carrier_phase,rss)
+        self.rx_pos = rearrange(self.rx_pos, 'n g c -> (n g) c') #[4277 * max_tx_num, 3]；[42770,3]
+        self.tx_pos = rearrange(self.tx_pos, 'n g c -> (n g) c') #[4277 * max_tx_num, 3]；[42770,3]
+        csi_data = rearrange(csi_data, 'n g c -> (n g) c') #[4277 * max_tx_num, 1+1]；[42770,2] (carrier_phase,rss)
+        self.carrier_phase = csi_data[:,0:1]
+        self.rss = csi_data[:,1:]
+        self.tx_csi_mask = self.tx_csi_mask.reshape(-1) # shape: [4277 * max_tx_num]; # shape: [42770]
+        self.tx_csi_mask = self.tx_csi_mask.unsqueeze(1).repeat(1, 2) # shape: [4277 * max_tx_num, 2]; # shape: [42770,2]
+
+        #normlize
+        self.carrier_phase = self.normalize_carrier_phase(self.carrier_phase) #[4277 * max_tx_num, 1]；[42770,1] 
+        self.rss = self.normalize_rss(self.rss)                               #[4277 * max_tx_num, 1]；[42770,1] 
+        self.csi = torch.cat([self.rss,self.carrier_phase],dim = -1)          #[4277 * max_tx_num, 2]；[42770,2]
+
+        # 处理数据
+        self.nn_inputs, self.nn_labels = self.load_data()
+        
+    def load_data(self):
+        """准备训练数据"""
+        # # 初始化输入输出张量
+        n_samples = self.rx_pos.size(0) #42770
+        input_size = 3 + 3 * self.alpha_res * self.beta_res + 3    # rx_pos, rays_d, tx_pos; 978
+        output_size = 2     # carrier_phase, rss; 2
+        nn_inputs = torch.zeros((n_samples, input_size), dtype=torch.float32) # rx_pos, rays_d, tx_pos
+        nn_labels = torch.zeros((n_samples, output_size), dtype=torch.float32)# carrier_phase, rss
+        
+        # 生成射线:原点+方向
+        ray_o, rays_d = self.gen_rays_gateways() # [n_samples, 3], [n_samples, 36*9, 3]; [42770,324,3]
+        rays_d = rearrange(rays_d, 'n g c -> n (g c)') # [n_samples, 36*9*3]; [42770,324*3]
+        
+        # 为每个样本准备数据
+        for data_counter, idx in tqdm(enumerate(range(n_samples)), total=n_samples): 
+            rx_pos = self.rx_pos[idx]  # [3]
+            tx_pos = self.tx_pos[idx]  # [3]
+            csi = self.csi[idx]  # [2]
+            nn_inputs[idx, :3] = rx_pos
+            nn_inputs[idx, 3:3+3*self.alpha_res*self.beta_res] = rays_d[idx]
+            nn_inputs[idx, 3+3*self.alpha_res*self.beta_res:] = tx_pos # tx_pos
+            nn_labels[idx, :] = csi #csi
+
+        return nn_inputs, nn_labels
+    
+
+    def normalize_carrier_phase(self, carrier_phase): #训练的时候把input跟label都norm了，所以预测出的也是norm的结果，去跟norm后的label计算loss
+        self.carrier_phase_max = torch.max(abs(carrier_phase))
+        return carrier_phase / self.carrier_phase_max
+
+    def denormalize_carrier_phase(self, carrier_phase): #推理的时候要知道预测的最终结果，那就需要denorm一下
+        assert self.carrier_phase_max is not None, "Please normalize csi first"
+        return carrier_phase * self.carrier_phase_max
+    
+    def normalize_rss(self, rss): #训练的时候把input跟label都norm了，所以预测出的也是norm的结果，去跟norm后的label计算loss
+        self.rss_max = torch.max(abs(rss))
+        return rss / self.rss_max
+
+    def denormalize_rss(self, rss): #推理的时候要知道预测的最终结果，那就需要denorm一下
+        assert self.rss_max is not None, "Please normalize csi first"
+        return rss * self.rss_max
+    
+
+    def gen_rays_gateways(self):
+        """生成射线采样点，与CSI_dataset相同"""
+        alphas = torch.linspace(0, 350, self.alpha_res) / 180 * np.pi
+        betas = torch.linspace(10, 90, self.beta_res) / 180 * np.pi
+        alphas = alphas.repeat(self.beta_res)
+        betas = betas.repeat_interleave(self.alpha_res)
+        
+        radius = 1
+        x = radius * torch.cos(alphas) * torch.cos(betas)
+        y = radius * torch.sin(alphas) * torch.cos(betas)
+        z = radius * torch.sin(betas)
+        
+        r_d = torch.stack([x, y, z], axis=0).T # [9*36, 3]
+        r_d = r_d.expand([self.rx_pos.size(0), self.beta_res * self.alpha_res, 3]) # [n_samples, 9*36, 3]
+        r_o = self.rx_pos  # 使用接收机位置作为射线原点 [n_samples, 3]
+        
+        return r_o.contiguous(), r_d.contiguous()
+    
+
+    def __getitem__(self, index):
+        """修改__getitem__方法来同时返回mask"""
+        inputs = self.nn_inputs[index]
+        labels = self.nn_labels[index]
+        mask = self.tx_csi_mask[index]  # [max_tx_num] #拓展两倍！
+        return inputs, labels, mask
+    
+
+    def __len__(self):  #因为这里写了这个函数,所以调用len(self)的时候就会调用这个函数
+        return len(self.dataset_index)
+
+
+
+
+
+dataset_dict = {"rfid": Spectrum_dataset, "ble": BLE_dataset, "mimo": CSI_dataset, "fsc": fsc_dataset}

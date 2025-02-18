@@ -135,40 +135,63 @@ class NeRF2_Runner():
         self.logger.info("Start training. Current Iteration:%d", self.current_iteration)
         while self.current_iteration <= self.total_iterations:
             with tqdm(total=len(self.train_iter), desc=f"Iteration {self.current_iteration}/{self.total_iterations}") as pbar: #显示进度条
-                for train_input, train_label in self.train_iter:
-                    if self.current_iteration > self.total_iterations:
-                        break
+                if self.dataset_type == 'fsc':
+                    for train_input, train_label, mask in self.train_iter:
+                        if self.current_iteration > self.total_iterations:
+                            break
+                        train_input, train_label, mask = train_input.to(self.devices), train_label.to(self.devices), mask.to(self.devices)
+                        rays_o, rays_d, tx_o = train_input[:, :3], train_input[:,3:3+9*36*3], train_input[:, 3+9*36*3:]
+                        predict = self.renderer.render_fsc(tx_o, rays_o, rays_d) #[batchsize,2]
+                        predict_csi = mask * predict
+                        loss = sig2mse(predict_csi, train_label)
 
-                    train_input, train_label = train_input.to(self.devices), train_label.to(self.devices)
-                    if self.dataset_type == "rfid":
-                        rays_o, rays_d, tx_o = train_input[:, :3], train_input[:, 3:6], train_input[:, 6:9]
-                        predict_spectrum = self.renderer.render_ss(tx_o, rays_o, rays_d)
-                        loss = sig2mse(predict_spectrum, train_label.view(-1))
-                    elif self.dataset_type == 'ble':
-                        tx_o, rays_o, rays_d = train_input[:, :3], train_input[:, 3:6], train_input[:, 6:]
-                        predict_rssi = self.renderer.render_rssi(tx_o, rays_o, rays_d)
-                        loss = sig2mse(predict_rssi, train_label.view(-1))
-                    elif self.dataset_type == 'mimo':
-                        uplink, rays_o, rays_d = train_input[:, :52], train_input[:, 52:55], train_input[:, 55:]
-                        predict_downlink = self.renderer.render_csi(uplink, rays_o, rays_d)
-                        predict_downlink = torch.concat((predict_downlink.real, predict_downlink.imag), dim=-1)
-                        loss = sig2mse(predict_downlink, train_label)
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        self.optimizer.step()
+                        self.cosine_scheduler.step()
+                        self.current_iteration += 1
 
+                        self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
+                        pbar.update(1)
+                        pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
+                        pbar.set_postfix_str('loss = {:.6f}, lr = {:.6f}'.format(loss.item(), self.optimizer.param_groups[0]['lr']))
 
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
-                    self.cosine_scheduler.step()
-                    self.current_iteration += 1
+                        if self.current_iteration % self.save_freq == 0:
+                            ckptname = self.save_checkpoint()
+                            pbar.write('Saved checkpoints at {}'.format(ckptname))
+                else:
+                    for train_input, train_label, mask in self.train_iter:
+                        if self.current_iteration > self.total_iterations:
+                            break
+                        train_input, train_label = train_input.to(self.devices), train_label.to(self.devices)
+                        if self.dataset_type == "rfid":
+                            rays_o, rays_d, tx_o = train_input[:, :3], train_input[:, 3:6], train_input[:, 6:9]
+                            predict_spectrum = self.renderer.render_ss(tx_o, rays_o, rays_d)
+                            loss = sig2mse(predict_spectrum, train_label.view(-1))
+                        elif self.dataset_type == 'ble':
+                            tx_o, rays_o, rays_d = train_input[:, :3], train_input[:, 3:6], train_input[:, 6:]
+                            predict_rssi = self.renderer.render_rssi(tx_o, rays_o, rays_d)
+                            loss = sig2mse(predict_rssi, train_label.view(-1))
+                        elif self.dataset_type == 'mimo':
+                            uplink, rays_o, rays_d = train_input[:, :52], train_input[:, 52:55], train_input[:, 55:]
+                            predict_downlink = self.renderer.render_csi(uplink, rays_o, rays_d)
+                            predict_downlink = torch.concat((predict_downlink.real, predict_downlink.imag), dim=-1)
+                            loss = sig2mse(predict_downlink, train_label)
 
-                    self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
-                    pbar.update(1)
-                    pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
-                    pbar.set_postfix_str('loss = {:.6f}, lr = {:.6f}'.format(loss.item(), self.optimizer.param_groups[0]['lr']))
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        self.optimizer.step()
+                        self.cosine_scheduler.step()
+                        self.current_iteration += 1
 
-                    if self.current_iteration % self.save_freq == 0:
-                        ckptname = self.save_checkpoint()
-                        pbar.write('Saved checkpoints at {}'.format(ckptname))
+                        self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
+                        pbar.update(1)
+                        pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
+                        pbar.set_postfix_str('loss = {:.6f}, lr = {:.6f}'.format(loss.item(), self.optimizer.param_groups[0]['lr']))
+
+                        if self.current_iteration % self.save_freq == 0:
+                            ckptname = self.save_checkpoint()
+                            pbar.write('Saved checkpoints at {}'.format(ckptname))
 
 
 
@@ -211,8 +234,6 @@ class NeRF2_Runner():
                     np.savetxt(os.path.join(self.logdir, self.expname, 'all_ssim.txt'), all_ssim, fmt='%.4f')
 
 
-
-
     def eval_network_rssi(self):
         """test the model and save predicted RSSI values to a file
         """
@@ -241,7 +262,6 @@ class NeRF2_Runner():
         self.logger.info("Total Median error:%.2f", np.median(abs(result[:,0] - result[:,1])))
 
 
-
     def eval_network_csi(self):
         """test the model and save predicted csi values to a file
         """
@@ -259,7 +279,7 @@ class NeRF2_Runner():
                 uplink, rays_o, rays_d = test_input[:, :52], test_input[:, 52:55], test_input[:, 55:]
                 predict_downlink = self.renderer.render_csi(uplink, rays_o, rays_d)  # [B, 26]
                 gt_downlink = test_label[:, :26] + 1j * test_label[:, 26:]
-                predict_downlink = self.test_set.denormalize_csi(predict_downlink)
+                predict_downlink = self.test_set.denormalize_csi(predict_downlink)   #这里denorm了，就知道预测的真正结果
                 gt_downlink = self.test_set.denormalize_csi(gt_downlink)
 
                 all_pred_csi[idx*self.batch_size:(idx+1)*self.batch_size] = predict_downlink
@@ -278,7 +298,7 @@ class NeRF2_Runner():
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/mimo-csi.yml', help='config file path')
+    parser.add_argument('--config', type=str, default='configs/fsc-csi.yml', help='config file path')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--dataset_type', type=str, default='mimo')

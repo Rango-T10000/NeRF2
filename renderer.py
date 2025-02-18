@@ -319,7 +319,98 @@ class Renderer_CSI(Renderer):
 
 
 
-renderer_dict = {"spectrum": Renderer_spectrum, "rssi": Renderer_RSSI, "csi": Renderer_CSI}
+class Renderer_fsc(Renderer):
+    """Renderer for CSI (integral from all directions)
+    """
+
+    def __init__(self, networks_fn, **kwargs) -> None:
+        """
+        Parameters
+        -----------------
+        near : float. The near bound of the rays
+        far : float. The far bound of the rays
+        n_samples: int. num of samples per ray
+        """
+        super().__init__(networks_fn, **kwargs)
+
+
+
+    def render_fsc(self, tx_o, rays_o, rays_d):
+        """render the RSSI for each gateway.
+
+        Parameters
+        ----------
+        tx_o: tensor. [batchsize, 30]. 10个tx的位置[x1,y1,z1,x2,y2,z2,...,x10,y10,z10]
+        rays_o : tensor. [batchsize, 3]. The origin of rays
+        rays_d : tensor. [batchsize, 9x36x3]. The direction of rays
+        """
+
+        rays_d = rearrange(rays_d, 'b (v d) -> b v d', d=3)    # [bs, 9x36 x 3]--->[bs, 9x36, 3]
+        batchsize, viewsize, _ = rays_d.shape
+        rays_o = repeat(rays_o, 'b d -> b v d', v=viewsize)    #[bs, 3]--->[bs, 9x36, 3]
+        tx_o = repeat(tx_o, 'b d -> b v d', v=viewsize)        #[bs, 30]--->[bs, 9x36, 30]
+
+        pts, t_vals = self.sample_points(rays_o, rays_d) # pts: [bs, 9x36, pts, 3]; t_vals: [bs, 9x36, pts]
+        views = repeat(rays_d, 'b v d -> b v p d', p=self.n_samples)  # [bs, 9x36, pts, 3]
+        tx_o = repeat(tx_o, 'b v d -> b v p d', p=self.n_samples)  # [bs, 9x36, pts, 30]
+
+        # Run network and compute outputs;
+        raw = self.network_fn(pts, views, tx_o)    # [batchsize, 9x36, pts, 4]
+        recv_signal = self.raw2outputs_signal(raw, t_vals, rays_d)  # [bs/batchsize,2]
+
+        return recv_signal
+
+
+    def raw2outputs_signal(self, raw, r_vals, rays_d):
+        """Transforms model's predictions to semantically meaningful values.
+
+        Parameters
+        ----------
+        raw : [batchsize, chunks, n_samples,  attn_output_dims+sig_output_dims]. Prediction from model.
+        r_vals : [batchsize, chunks:36*9, n_samples]. Integration distance.
+        rays_d : [batchsize,chunks:36*9, 3]. Direction of each ray
+
+        Return:
+        ----------
+        receive_signal : [batchsize, 2]. 1个csi的预测值
+        """
+        wavelength = sc.c / 2.4e9  #sc.c是光速，sc是开头引入的一个python的物理常数库
+        # raw2alpha = lambda raw, dists: 1.-torch.exp(-raw*dists)
+        # raw2phase = lambda raw, dists: torch.exp(1j*raw*dists)
+        raw2phase = lambda raw, dists: raw + 2*np.pi*dists/wavelength  #模型预测的相位偏差 + 距离引起的相位偏差  = att_p + 2*pi*d/wavelength
+        raw2amp = lambda raw, dists: -raw*dists                        #模型预测的幅度衰减 - att_a*d
+
+        dists = r_vals[...,1:] - r_vals[...,:-1] #[batchsize, chunks:36*9, n_samples/points-1]
+        dists = torch.cat([dists, torch.Tensor([1e10]).cuda().expand(dists[...,:1].shape)], -1)  # [batchsize, chunks, n_samples/points]
+        dists = dists * torch.norm(rays_d[...,None,:], dim=-1)  # [batchsize, chunks, n_samples/points].
+
+        att_a, att_p, s_a, s_p = raw[...,0], raw[...,1], raw[...,2], raw[...,3]    # [batchsize,chunks:36*9,n_samples]
+        att_p, s_p = torch.sigmoid(att_p)*np.pi*2-np.pi, torch.sigmoid(s_p)*np.pi*2-np.pi          #将预测的值映射到-pi~pi：过一个sigmoid乘以2pi,再减去pi
+        att_a, s_a = abs(F.leaky_relu(att_a)), abs(F.leaky_relu(s_a))
+
+        amp = raw2amp(att_a, dists)     #[batchsize, chunks, n_samples/points]
+        phase = raw2phase(att_p, dists) #[batchsize, chunks, n_samples/points]
+
+        #point/vocxel loss;每条线上每个点自己的0~r积分，就是自己这个点到rx经过的所有voxel造成的累积
+        amp_i = torch.exp(torch.cumsum(amp, -1))            #[batchsize, chunks, n_samples/points]
+        phase_i = torch.exp(1j*torch.cumsum(phase, -1))     #[batchsize, chunks, n_samples/points]
+
+        #path loss,这里补的10^10就是原点到最远处的距离，包含了卫星
+        path = torch.cat([r_vals[...,1:], torch.Tensor([1e10]).cuda().expand(r_vals[...,:1].shape)], -1) #[batchsize, chunks, n_samples/points]
+        path_loss = wavelength/(4*np.pi)/path #[batchsize, chunks, n_samples/points]                     #[batchsize, chunks, n_samples/points]
+        
+        #每条线上所有点求和
+        recv_signal = torch.sum(s_a*torch.exp(1j*s_p)*amp_i*phase_i*path_loss, -1)  # integral along line,每条线上所有点求和 [batchsize,chunks]
+        recv_signal = torch.sum(recv_signal, 1)                                     # integral along direction,所有方向的所有线求和 [batchsize]
+        # Calculate RSS and carrier phase
+        rss = torch.abs(recv_signal)  # [batchsize]
+        carrier_phase = torch.angle(recv_signal)  # [batchsize]
+
+        return torch.stack([rss, carrier_phase], dim=-1)  # [batchsize, 2]
+
+
+
+renderer_dict = {"spectrum": Renderer_spectrum, "rssi": Renderer_RSSI, "csi": Renderer_CSI, "fsc": Renderer_fsc}
 
 # 上面这3个类分别对应了3种不同的信号预测任务，分别是spectrum, rssi, csi，其实本质一样就是输入不同，输出都可预测一个复数（幅度+相位）
 # render以及叠加本质是一样的，都是对信号进行积分，但是输入的数据集不一样，所以预处理的代码不同
