@@ -452,6 +452,8 @@ class fsc_dataset(Dataset):
         self.carrier_phase = self.normalize_carrier_phase(self.carrier_phase) #[4277 * max_tx_num, 1]；[42770,1] 
         self.rss = self.normalize_rss(self.rss)                               #[4277 * max_tx_num, 1]；[42770,1] 
         self.csi = torch.cat([self.rss,self.carrier_phase],dim = -1)          #[4277 * max_tx_num, 2]；[42770,2]
+        self.rx_pos = self.normalize_rx_pos(self.rx_pos)
+        self.tx_pos = self.normalize_tx_pos(self.tx_pos)
 
         # 处理数据
         self.nn_inputs, self.nn_labels = self.load_data()
@@ -498,6 +500,43 @@ class fsc_dataset(Dataset):
         assert self.rss_max is not None, "Please normalize csi first"
         return rss * self.rss_max
     
+    def normalize_tx_pos(self, tx_pos):
+        """Normalize transmitter ECEF coordinates by finding max absolute value for each dimension
+        
+        Args:
+            tx_pos: tensor of shape [..., 3] containing ECEF coordinates
+        Returns:
+            normalized positions tensor of same shape
+        """
+        # Find max absolute value for each dimension (x,y,z)
+        self.tx_pos_max_xyz = torch.max(torch.abs(tx_pos), dim=0)[0]  # [3]
+        
+        # Normalize each dimension separately
+        return tx_pos / self.tx_pos_max_xyz
+
+    def normalize_rx_pos(self, rx_pos):
+        """Normalize receiver ECEF coordinates by finding max absolute value for each dimension
+        
+        Args:
+            rx_pos: tensor of shape [..., 3] containing ECEF coordinates
+        Returns:
+            normalized positions tensor of same shape
+        """
+        # Find max absolute value for each dimension (x,y,z)
+        self.rx_pos_max_xyz = torch.max(torch.abs(rx_pos), dim=0)[0]  # [3]
+        
+        # Normalize each dimension separately
+        return rx_pos / self.rx_pos_max_xyz
+
+    def denormalize_tx_pos(self, normalized_tx_pos):
+        """Denormalize the transmitter positions back to ECEF coordinates"""
+        assert hasattr(self, 'tx_pos_max_xyz'), "Please normalize tx_pos first"
+        return normalized_tx_pos * self.tx_pos_max_xyz
+
+    def denormalize_rx_pos(self, normalized_rx_pos):
+        """Denormalize the receiver positions back to ECEF coordinates"""
+        assert hasattr(self, 'rx_pos_max_xyz'), "Please normalize rx_pos first"
+        return normalized_rx_pos * self.rx_pos_max_xyz
 
     def gen_rays_gateways(self):
         """生成射线采样点，与CSI_dataset相同"""
@@ -527,7 +566,7 @@ class fsc_dataset(Dataset):
     
 
     def __len__(self):  #因为这里写了这个函数,所以调用len(self)的时候就会调用这个函数
-        return len(self.dataset_index)
+        return self.rx_pos.size(0)
 
 
 

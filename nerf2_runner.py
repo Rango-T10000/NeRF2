@@ -113,6 +113,7 @@ class NeRF2_Runner():
 
 
     def save_checkpoint(self):
+        
         ckptsdir = os.path.join(self.logdir, self.expname, 'ckpts')
         model_lst = [x for x in sorted(os.listdir(ckptsdir)) if x.endswith('.tar')]
         if len(model_lst) > 2:
@@ -295,6 +296,71 @@ class NeRF2_Runner():
                                                                               'snr': snr.cpu().numpy()})
 
 
+    def eval_network_fsc(self):
+        """test the model and save predicted fsc_csi values to a file
+        """
+        self.logger.info("Start evaluation")
+        self.nerf2_network.eval()
+
+        n_data = len(self.test_set)  # number of test data
+
+        all_pred_csi = torch.zeros((n_data, 2), dtype=torch.float32)
+        all_gt_csi = torch.zeros((n_data, 2), dtype=torch.float32)
+        with torch.no_grad(): 
+            for idx, (test_input, test_label, mask) in tqdm(enumerate(self.test_iter), total=len(self.test_iter)):
+                test_input, test_label, mask = test_input.to(self.devices), test_label.to(self.devices), mask.to(self.devices)
+                rays_o, rays_d, tx_o = test_input[:, :3], test_input[:,3:3+9*36*3], test_input[:, 3+9*36*3:]
+                predict = self.renderer.render_fsc(tx_o, rays_o, rays_d) #[batchsize,2]
+                predict_csi = mask * predict #[batchsize,2]
+                gt_csi = test_label
+
+                predict_csi[:,0:1] = self.test_set.denormalize_rss(predict_csi[:,0:1])   #这里denorm了，就知道预测的真正结果
+                gt_csi[:,0:1] = self.test_set.denormalize_rss(gt_csi[:,0:1])               
+                predict_csi[:,1:2] = self.test_set.denormalize_carrier_phase(predict_csi[:,1:2])   #这里denorm了，就知道预测的真正结果
+                gt_csi[:,1:2] = self.test_set.denormalize_carrier_phase(gt_csi[:,1:2])
+
+                all_pred_csi[idx*self.batch_size:(idx+1)*self.batch_size] = predict_csi
+                all_gt_csi[idx*self.batch_size:(idx+1)*self.batch_size] = gt_csi
+        
+        # 仅保留有效数据
+        valid_indices = (all_gt_csi != 0).any(dim=1)  # 任何一列不为 0 的数据都是有效的
+        valid_pred_csi = all_pred_csi[valid_indices]
+        valid_gt_csi = all_gt_csi[valid_indices]        
+        rss_mse, phase_mse, total_error = fsc_evaluate_2(valid_pred_csi, valid_gt_csi)
+        snr = csi2snr_2(valid_pred_csi, valid_gt_csi)
+        rss_acc, phase_acc = fsc_accuracy(valid_pred_csi, valid_gt_csi).unbind(dim=1)  # 分别获取 RSS 和 Carrier Phase 的准确率
+
+        self.logger.info("Median snr:%.2f", torch.median(snr))
+        self.logger.info("Median rss_acc:%.2f", torch.median(rss_acc))
+        self.logger.info("Median phase_acc:%.2f", torch.median(phase_acc))
+        self.logger.info("rss_mse:%.2f", rss_mse)
+        self.logger.info("phase_mse:%.2f", phase_mse)
+        self.logger.info("total_error:%.2f", total_error)
+
+        scio.savemat(os.path.join(self.logdir, self.expname, "result.mat"), {'pred_csi': valid_pred_csi.cpu().numpy(),
+                                                                              'gt_csi': valid_gt_csi.cpu().numpy(),
+                                                                              'snr': snr.cpu().numpy(),
+                                                                              'rss_acc': rss_acc.cpu().numpy(),
+                                                                              'phase_acc': phase_acc.cpu().numpy(),
+                                                                              'rss_mse': rss_mse.cpu().numpy(),
+                                                                              'phase_mse': phase_mse.cpu().numpy(),
+                                                                              'total_error': total_error.cpu().numpy(),
+                                                                            })
+        print("valid_pred_csi shape:", valid_pred_csi.shape)  # (4086, 2)
+        print("valid_gt_csi shape:", valid_gt_csi.shape)  # (4086, 2)
+
+        print("rss_mse shape:", rss_mse.shape)  # (4086, 1)  # 均方误差
+        print("phase_mse shape:", phase_mse.shape)  # (4086, 1)
+        print("total_error shape:", total_error.shape)  # (4086, 1)
+
+        print("snr shape:", snr.shape)  # (4086, 1)  # 信噪比
+
+        print("rss_acc shape:", rss_acc.shape)  # (4086,)  # 解绑后每列变为 1D
+        print("phase_acc shape:", phase_acc.shape)  # (4086,)
+        
+
+
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -326,3 +392,5 @@ if __name__ == '__main__':
             worker.eval_network_rssi()
         elif args.dataset_type == 'mimo':
             worker.eval_network_csi()
+        elif args.dataset_type == 'fsc':
+            worker.eval_network_fsc()

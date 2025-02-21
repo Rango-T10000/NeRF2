@@ -357,7 +357,6 @@ class Renderer_fsc(Renderer):
         # Run network and compute outputs;
         raw = self.network_fn(pts, views, tx_o)    # [batchsize, 9x36, pts, 4]
         recv_signal = self.raw2outputs_signal(raw, t_vals, rays_d)  # [bs/batchsize,2]
-
         return recv_signal
 
 

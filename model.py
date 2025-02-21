@@ -15,6 +15,38 @@ csi2snr = lambda x, y: -10 * torch.log10(
     torch.norm(y, dim=(1, 2)) ** 2
 )
 
+csi2snr_2 = lambda x, y: -10 * torch.log10(
+    torch.norm(x - y, dim=(1)) ** 2 /
+    torch.norm(y, dim=(1)) ** 2
+)
+
+#---------计算rss和carrier phase的预测误差---------
+fsc_evaluate = lambda pred, gt: (
+    torch.mean((pred[:, 0:1] - gt[:, 0:1]) ** 2, dim=1, keepdim=True),  # RSS MSE (9603, 1)
+    torch.mean((torch.remainder(pred[:, 1:2] - gt[:, 1:2] + torch.pi, 2 * torch.pi) - torch.pi) ** 2, dim=1, keepdim=True),  # Carrier Phase MSE (9603, 1)
+    0.5 * torch.mean((pred[:, 0:1] - gt[:, 0:1]) ** 2, dim=1, keepdim=True) + 
+    0.5 * torch.mean((torch.remainder(pred[:, 1:2] - gt[:, 1:2] + torch.pi, 2 * torch.pi) - torch.pi) ** 2, dim=1, keepdim=True)  # Total Error (9603, 1)
+)
+
+#均方误差：
+fsc_evaluate_2 = lambda pred, gt: (
+    torch.mean((pred[:, 0] - gt[:, 0]) ** 2),  # RSS MSE,返回是标量torch.Size([])
+    torch.mean((torch.remainder(pred[:, 1] - gt[:, 1] + torch.pi, 2 * torch.pi) - torch.pi) ** 2),  # Carrier Phase MSE返回是标量torch.Size([])
+    0.5 * torch.mean((pred[:, 0] - gt[:, 0]) ** 2) + 
+    0.5 * torch.mean((torch.remainder(pred[:, 1] - gt[:, 1] + torch.pi, 2 * torch.pi) - torch.pi) ** 2)  # Total Error返回是标量torch.Size([])
+)
+
+#accuracy
+fsc_accuracy = lambda pred, gt: torch.stack([
+    100 * (1 - torch.abs(pred[:, 0] - gt[:, 0]) / (torch.abs(gt[:, 0]) + 1e-6)),  # RSS Accuracy
+    100 * (1 - torch.abs(pred[:, 1] - gt[:, 1]) / (torch.abs(gt[:, 1]) + 1e-6))  # Carrier Phase Accuracy
+], dim=1)  # Shape: (样本数, 2)
+
+
+
+
+
+
 
 
 
@@ -152,21 +184,72 @@ class NeRF2(nn.Module):
         ----------
         outputs: [batchsize, n_samples, 4].   attn_amp, attn_phase, signal_amp, signal_phase
         """
+        # Check for NaN or Inf in pts, t_vals, views, and tx_o
+        if torch.isnan(pts).any() or torch.isinf(pts).any():
+            print("NaN or Inf detected in pts_before_PE:")
+            print(pts)
+            
+        if torch.isnan(view).any() or torch.isinf(view).any():
+            print("NaN or Inf detected in view_before_PE:")
+            print(view)
+            
+        if torch.isnan(tx).any() or torch.isinf(tx).any():
+            print("NaN or Inf detected in tx_before_PE:")
+            print(tx)
 
         # position encoding; #.contiguous() 是为了保证 Tensor 在内存中的连续性，方便 view() 操作
         pts = self.embed_pts_fn(pts).contiguous() # [batchsize, n_samples/points, input_pts_dim], e.g.[batchsize, 64, 3]---->[batchsize, 64, 63]
         view = self.embed_view_fn(view).contiguous()
         tx = self.embed_tx_fn(tx).contiguous()
+
+
+        # Check for NaN or Inf in pts, t_vals, views, and tx_o
+        if torch.isnan(pts).any() or torch.isinf(pts).any():
+            print("NaN or Inf detected in pts:")
+            print(pts)
+            
+        if torch.isnan(view).any() or torch.isinf(view).any():
+            print("NaN or Inf detected in views:")
+            print(view)
+            
+        if torch.isnan(tx).any() or torch.isinf(tx).any():
+            print("NaN or Inf detected in tx_o:")
+            print(tx)
+
+
         shape = pts.shape
         pts = pts.view(-1, list(pts.shape)[-1]) # [batchsize*n_samples, input_pts_dim]
         view = view.view(-1, list(view.shape)[-1])
         tx = tx.view(-1, list(tx.shape)[-1])
+
+
+        # Check for NaN or Inf in pts, t_vals, views, and tx_o
+        if torch.isnan(pts).any() or torch.isinf(pts).any():
+            print("NaN or Inf detected in pts_-1:")
+            print(pts)
+            
+        if torch.isnan(view).any() or torch.isinf(view).any():
+            print("NaN or Inf detected in views_-1:")
+            print(view)
+            
+        if torch.isnan(tx).any() or torch.isinf(tx).any():
+            print("NaN or Inf detected in tx_-1:")
+            print(tx)
 
         x = pts
         for i, layer in enumerate(self.attenuation_linears):
             x = F.relu(layer(x))
             if i in self.skips:
                 x = torch.cat([pts, x], -1)
+        
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("NaN or Inf detected in attn:")
+            print(x)   
+
+        # 在调用位置编码前检查 pts 是否为 NaN 或 Inf
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("NaN or Inf detected in attn:")
+            print(x)    
 
         attn = self.attenuation_output(x)    # (batch_size*36*9*n_points, 2); (batch_size*36*9*n_points, attn_output_dims),这个输出纬度根据数据集以及任务的不同在配置文件修改
         feature = self.feature_layer(x)      # (batch_size*36*9*n_points, W); (batch_size*36*9*n_points, 256)
@@ -175,6 +258,14 @@ class NeRF2(nn.Module):
         for i, layer in enumerate(self.signal_linears):
             x = F.relu(layer(x))
         signal = self.signal_output(x)    #[batch_size*36*9*n_points, 20]; [batch_size*36*9*n_points, sig_output_dims]这个输出纬度根据数据集以及任务的不同在配置文件修改
+
+        # 在调用位置编码前检查 pts 是否为 NaN 或 Inf
+        if torch.isnan(attn).any() or torch.isinf(attn).any():
+            print("NaN or Inf detected in attn:")
+            print(attn)        
+        if torch.isnan(signal).any() or torch.isinf(signal).any():
+            print("NaN or Inf detected in attn:")
+            print(signal)   
 
         outputs = torch.cat([attn, signal], -1).contiguous()    # [batchsize, n_samples, 4]
         return outputs.view(shape[:-1]+outputs.shape[-1:])
