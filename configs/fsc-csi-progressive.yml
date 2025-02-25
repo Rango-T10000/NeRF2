@@ -21,8 +21,8 @@ train:
   weight_decay: 5e-5
   T_max: 10000
   eta_min: 1e-6
-  batch_size: 64  #最好是2的幂，对硬件来说底层存储效率最大化
-  total_iterations: 40000  #70000
+  batch_size: 16  #最好是2的幂，对硬件来说底层存储效率最大化
+  total_iterations: 400  #70000
   load_ckpt: True
 
   save_freq: 100

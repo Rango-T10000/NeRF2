@@ -78,20 +78,29 @@ class NeRF2_Runner():
         self.save_freq = kwargs_train['save_freq']
 
         ## Dataset
-        dataset = dataset_dict[dataset_type]  #这里决定是dataset是dataloader.py中的Class中的那一个实例化
-        train_index = os.path.join(self.datadir, "train_index.txt")
-        test_index = os.path.join(self.datadir, "test_index.txt")
-        if not os.path.exists(train_index) or not os.path.exists(test_index):
-            split_dataset(self.datadir, ratio=0.8, dataset_type=dataset_type)
-        #------------------------original version---------------------------
-        self.logger.info("Loading training set...")
-        self.train_set = dataset(self.datadir, train_index, self.scale_worldsize)
-        self.logger.info("Loading test set...")
-        self.test_set = dataset(self.datadir, test_index, self.scale_worldsize)
+        self.dataset = dataset_dict[dataset_type]  #这里决定是dataset是dataloader.py中的Class中的那一个实例化
+        self.train_index = os.path.join(self.datadir, "train_index.txt")
+        self.test_index = os.path.join(self.datadir, "test_index.txt")
+        # if not os.path.exists(train_index) or not os.path.exists(test_index):
+        #     split_dataset(self.datadir, ratio=0.8, dataset_type=dataset_type)
+        # #------------------------original version---------------------------
+        # self.logger.info("Loading training set...")
+        # self.train_set = dataset(self.datadir, train_index, self.scale_worldsize)
+        # self.logger.info("Loading test set...")
+        # self.test_set = dataset(self.datadir, test_index, self.scale_worldsize)
 
-        self.train_iter = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=0)
-        self.test_iter = DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=0)
-        self.logger.info("Train set size:%d, Test set size:%d", len(self.train_set), len(self.test_set))
+        # self.train_iter = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=0)
+        # self.test_iter = DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=0)
+        # self.logger.info("Train set size:%d, Test set size:%d", len(self.train_set), len(self.test_set))
+
+        # #------------------------fsc_progressive_version---------------------
+        # self.logger.info("Loading progressive training and val set...")
+        # self.train_set = dataset(self.datadir, train_index, test_index, self.scale_worldsize)
+        # self.train_iter = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=0)
+        # self.logger.info("Train and val set size:%d", len(self.train_set))
+
+        #一些超参数的初始化
+        self.num_scenes = 92        
 
 
     def load_checkpoints(self):
@@ -130,14 +139,59 @@ class NeRF2_Runner():
         return ckptname
 
 
-
     def train(self):
         """train the model
         """
         self.logger.info("Start training. Current Iteration:%d", self.current_iteration)
         while self.current_iteration <= self.total_iterations:
             with tqdm(total=len(self.train_iter), desc=f"Iteration {self.current_iteration}/{self.total_iterations}") as pbar: #显示进度条
-                if self.dataset_type == 'fsc':
+
+                if self.dataset_type == 'fsc_progressive':
+                    for scene_id in range(self.num_scenes): #每次用一个scene中的前10s数据训练,后5s数据val
+                        # print(f"Training scene {scene_id + 1}/{self.num_scenes}...")
+                        self.logger.info(f"Training scene {scene_id + 1}/{self.num_scenes}...")
+
+
+                        # **1. 只加载当前 scene 的前 10s 训练数据**
+                        train_dataset = self.dataset(self.datadir, self.train_index, self.scale_worldsize, scene_id)
+                        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
+
+                        # **2. 训练当前 scene**
+                        self.nerf2_network.train()
+                        for iter in range(self.total_iterations):  
+                            if self.current_iteration > self.total_iterations:
+                                break
+                            for train_input, train_label, mask in train_loader:
+                                
+                                output = model(train_input)
+                                loss = criterion(output, train_label)
+
+                                self.optimizer.zero_grad()
+                                loss.backward()
+                                self.optimizer.step()
+                                self.cosine_scheduler.step()
+                                self.current_iteration += 1
+
+
+                        # **3. 评估当前 scene（使用后 5s 数据）**
+                        val_data = train_dataset.json_test_data  # 5s 评估数据
+                        val_loader = DataLoader(val_data, batch_size=self.batch_size, shuffle=False)  
+
+                        self.nerf2_network.eval()
+                        val_loss = 0
+                        with torch.no_grad():
+                            for val_sample in val_loader:
+                                val_input, val_label, val_mask = val_sample['input'], val_sample['label'], val_sample.get('mask', None)
+                                val_output = model(val_input)
+                                val_loss += criterion(val_output, val_label).item()
+
+                        print(f"Scene {scene_id} Val Loss: {val_loss / len(val_loader)}")
+
+                        # 进入下一个 scene
+                        if scene_id + 1 < self.num_scenes:
+                            train_dataset.set_scene(scene_id + 1)  # 更新数据集
+
+#---------------------------------------------
                     for train_input, train_label, mask in self.train_iter:
                         if self.current_iteration > self.total_iterations:
                             break
@@ -160,66 +214,9 @@ class NeRF2_Runner():
 
                         if self.current_iteration % self.save_freq == 0:
                             ckptname = self.save_checkpoint()
-                            pbar.write('Saved checkpoints at {}'.format(ckptname))
-                elif self.dataset_type == 'fsc_progressive':
-                    for train_input, train_label, mask in self.train_iter:
-                        if self.current_iteration > self.total_iterations:
-                            break
-                        train_input, train_label, mask = train_input.to(self.devices), train_label.to(self.devices), mask.to(self.devices)
-                        rays_o, rays_d, tx_o = train_input[:, :3], train_input[:,3:3+9*36*3], train_input[:, 3+9*36*3:]
-                        predict = self.renderer.render_fsc(tx_o, rays_o, rays_d) #[batchsize,2]
-                        predict_csi = mask * predict
-                        loss = sig2mse(predict_csi, train_label)
-
-                        self.optimizer.zero_grad()
-                        loss.backward()
-                        self.optimizer.step()
-                        self.cosine_scheduler.step()
-                        self.current_iteration += 1
-
-                        self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
-                        pbar.update(1)
-                        pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
-                        pbar.set_postfix_str('loss = {:.6f}, lr = {:.6f}'.format(loss.item(), self.optimizer.param_groups[0]['lr']))
-
-                        if self.current_iteration % self.save_freq == 0:
-                            ckptname = self.save_checkpoint()
-                            pbar.write('Saved checkpoints at {}'.format(ckptname))                
+                            pbar.write('Saved checkpoints at {}'.format(ckptname))     
                 else:
-                    for train_input, train_label, mask in self.train_iter:
-                        if self.current_iteration > self.total_iterations:
-                            break
-                        train_input, train_label = train_input.to(self.devices), train_label.to(self.devices)
-                        if self.dataset_type == "rfid":
-                            rays_o, rays_d, tx_o = train_input[:, :3], train_input[:, 3:6], train_input[:, 6:9]
-                            predict_spectrum = self.renderer.render_ss(tx_o, rays_o, rays_d)
-                            loss = sig2mse(predict_spectrum, train_label.view(-1))
-                        elif self.dataset_type == 'ble':
-                            tx_o, rays_o, rays_d = train_input[:, :3], train_input[:, 3:6], train_input[:, 6:]
-                            predict_rssi = self.renderer.render_rssi(tx_o, rays_o, rays_d)
-                            loss = sig2mse(predict_rssi, train_label.view(-1))
-                        elif self.dataset_type == 'mimo':
-                            uplink, rays_o, rays_d = train_input[:, :52], train_input[:, 52:55], train_input[:, 55:]
-                            predict_downlink = self.renderer.render_csi(uplink, rays_o, rays_d)
-                            predict_downlink = torch.concat((predict_downlink.real, predict_downlink.imag), dim=-1)
-                            loss = sig2mse(predict_downlink, train_label)
-
-                        self.optimizer.zero_grad()
-                        loss.backward()
-                        self.optimizer.step()
-                        self.cosine_scheduler.step()
-                        self.current_iteration += 1
-
-                        self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
-                        pbar.update(1)
-                        pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
-                        pbar.set_postfix_str('loss = {:.6f}, lr = {:.6f}'.format(loss.item(), self.optimizer.param_groups[0]['lr']))
-
-                        if self.current_iteration % self.save_freq == 0:
-                            ckptname = self.save_checkpoint()
-                            pbar.write('Saved checkpoints at {}'.format(ckptname))
-
-
+                    break           
 
     def eval_network_spectrum(self):
         """test the model
@@ -259,7 +256,6 @@ class NeRF2_Runner():
                     save_img_idx += 1
                     np.savetxt(os.path.join(self.logdir, self.expname, 'all_ssim.txt'), all_ssim, fmt='%.4f')
 
-
     def eval_network_rssi(self):
         """test the model and save predicted RSSI values to a file
         """
@@ -286,7 +282,6 @@ class NeRF2_Runner():
 
         result = np.loadtxt(os.path.join(self.logdir,self.expname, "result.txt"), delimiter=",")
         self.logger.info("Total Median error:%.2f", np.median(abs(result[:,0] - result[:,1])))
-
 
     def eval_network_csi(self):
         """test the model and save predicted csi values to a file
@@ -319,7 +314,6 @@ class NeRF2_Runner():
         scio.savemat(os.path.join(self.logdir, self.expname, "result.mat"), {'pred_csi': all_pred_csi.cpu().numpy(),
                                                                               'gt_csi': all_gt_csi.cpu().numpy(),
                                                                               'snr': snr.cpu().numpy()})
-
 
     def eval_network_fsc(self):
         """test the model and save predicted fsc_csi values to a file
