@@ -327,6 +327,10 @@ class NeRF2_Runner():
         valid_pred_csi = all_pred_csi[valid_indices]
         valid_gt_csi = all_gt_csi[valid_indices]        
         rss_mse, phase_mse, total_error = fsc_evaluate_2(valid_pred_csi, valid_gt_csi)
+
+        # valid_pred_csi = valid_pred_csi[:,0:1] * torch.exp(1j * valid_pred_csi[:,1:2])
+        # valid_gt_csi = valid_gt_csi[:,0:1] * torch.exp(1j * valid_gt_csi[:,1:2])
+
         snr = csi2snr_2(valid_pred_csi, valid_gt_csi)
         rss_acc, phase_acc = fsc_accuracy(valid_pred_csi, valid_gt_csi).unbind(dim=1)  # 分别获取 RSS 和 Carrier Phase 的准确率
 
