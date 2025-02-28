@@ -184,8 +184,7 @@ class NeRF2_Runner():
                             ckptname = self.save_checkpoint()
                             pbar.write('Saved checkpoints at {}'.format(ckptname))
 
-
-                elif self.dataset_type == 'fsc_progressive':
+                elif self.dataset_type == 'fsc_4rx':
                     for train_input, train_label, mask in self.train_iter:
                         if self.current_iteration > self.total_iterations:
                             break
@@ -199,8 +198,16 @@ class NeRF2_Runner():
                         loss.backward()
                         self.optimizer.step()
                         self.cosine_scheduler.step()
-                        self.current_iteration += 1
 
+                        #间隔固定的val_freq进行test
+                        if self.current_iteration % self.val_freq == 0:
+                            batch_idx = self.current_iteration // self.val_freq - 1
+                            test_input, test_label, mask = self.get_test_batch(self.test_iter, batch_idx) #从test samples取第 self.current_iteration // self.val_freq 个 batch的数据
+                            if test_input is not None:
+                                self.eval_network_fsc_2(test_input, test_label, mask, batch_idx)
+
+
+                        self.current_iteration += 1 #iter数量+1
                         self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
                         pbar.update(1)
                         pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
@@ -208,7 +215,8 @@ class NeRF2_Runner():
 
                         if self.current_iteration % self.save_freq == 0:
                             ckptname = self.save_checkpoint()
-                            pbar.write('Saved checkpoints at {}'.format(ckptname))                
+                            pbar.write('Saved checkpoints at {}'.format(ckptname))
+
                 else:
                     for train_input, train_label, mask in self.train_iter:
                         if self.current_iteration > self.total_iterations:

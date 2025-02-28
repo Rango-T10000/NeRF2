@@ -1,7 +1,7 @@
 
 ### Path settings
 path:
-  expname: fsc-exp-progressive_pred_traj-3_1
+  expname: fsc-exp-progressive_pred_traj_4rx-1
   datadir: fsc_data/pred_traj_data     #注意dataloader.py中的这里也要改self.csidata_dir = os.path.join(datadir, 'combined_gnss_data_pred_rx_pos.json')
   logdir: logs/fsc/
 
