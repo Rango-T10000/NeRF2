@@ -62,6 +62,7 @@ def paint_location(loc_path, save_path):
 
 if __name__ == '__main__':
 
-    loc_path = "data/s23/"
-    save_path = "data/s23/"
+    #用于画出数据集中的train/test中tx_pos的位置分布的
+    loc_path = "data/RFID/s23/"
+    save_path = "data/RFID/s23/"
     paint_location(loc_path, save_path)

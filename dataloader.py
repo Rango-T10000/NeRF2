@@ -382,7 +382,7 @@ class fsc_progressive_dataset(Dataset):
         super().__init__()
         self.datadir = datadir
         self.csidata_dir = os.path.join(datadir, 'combined_gnss_data.json')
-        self.dataset_train_index = np.loadtxt(indexdir, dtype=int)
+        self.dataset_index = np.loadtxt(indexdir, dtype=int)
         self.beta_res, self.alpha_res = 9, 36  # resolution of rays
         self.train_sample_lens = 10
         self.test_sample_lens = 5
@@ -392,9 +392,9 @@ class fsc_progressive_dataset(Dataset):
             self.json_data = json.load(file)
         
         #按照索引值把train或test set先取出来
-        self.json_data = []
+        self.json_index_data = []
         for idx in self.dataset_index:
-            self.json_data.append(self.json_data[idx])
+            self.json_index_data.append(self.json_data[idx])
 
         #-------------提取所有rx_positions-------------
         rx_positions_list = []
@@ -406,7 +406,7 @@ class fsc_progressive_dataset(Dataset):
                 if com['rx_pos']:  # 确保tx_pos不为空
                     rx_positions_list.append(com['rx_pos'])
         # 转换为tensor
-        self.rx_pos = torch.tensor(rx_positions_list, dtype=torch.float32)  # shape: [4277, 3];理论是应该len = samples * 4个天线，但是在某些时间戳下有的天线没有数据
+        self.rx_pos = torch.tensor(rx_positions_list, dtype=torch.float32)  # shape: [5040, 3];理论是应该len = samples * 4个天线，但是在某些时间戳下有的天线没有数据
 
         #-------------提取所有[tx_positions,carrier_phase,rss],对于tx数量不固定使用补0补成一样的，用同纬度mask值标记的方法-------------
         tx_csi_list = []
@@ -433,27 +433,27 @@ class fsc_progressive_dataset(Dataset):
                 mask.append(0)
             tx_csi_mask_list.append(mask)
         # 转换为 tensor
-        self.tx_csi = torch.tensor(tx_csi_list, dtype=torch.float32)  # shape: [4277, max_tx_num, 3+1+1]；[4277,10,5]
-        self.tx_csi_mask = torch.tensor(tx_csi_mask_list, dtype=torch.float32)  # shape: [4277, max_tx_num] 用于标记tx_csi的mask，即哪些是真实数据，哪些是补0的数据
+        self.tx_csi = torch.tensor(tx_csi_list, dtype=torch.float32)  # shape: [5040, max_tx_num, 3+1+1]；[5040,10,5]
+        self.tx_csi_mask = torch.tensor(tx_csi_mask_list, dtype=torch.float32)  # shape: [5040, max_tx_num] 用于标记tx_csi的mask，即哪些是真实数据，哪些是补0的数据
 
         #注意，这里的self.tx_csi_mask是用于标记tx_csi的mask，即原本有的数据我们标记为1，补0的数据我们标记为0
         #这样在训练结束的时候我们可以根据这个mask来计算loss，不计算补0的数据的loss
 
-        self.rx_pos = self.rx_pos.unsqueeze(1).repeat(1, self.max_tx_num, 1) #[4277, max_tx_num, 3]；[4277,10,3]
-        self.tx_pos = self.tx_csi[...,:3]   #[4277, max_tx_num, 3]；[4277,10,3]
-        csi_data = self.tx_csi[...,3:] #[4277, max_tx_num, 1+1]；[4277,10,2] (carrier_phase,rss)
-        self.rx_pos = rearrange(self.rx_pos, 'n g c -> (n g) c') #[4277 * max_tx_num, 3]；[42770,3]
-        self.tx_pos = rearrange(self.tx_pos, 'n g c -> (n g) c') #[4277 * max_tx_num, 3]；[42770,3]
-        csi_data = rearrange(csi_data, 'n g c -> (n g) c') #[4277 * max_tx_num, 1+1]；[42770,2] (carrier_phase,rss)
+        self.rx_pos = self.rx_pos.unsqueeze(1).repeat(1, self.max_tx_num, 1) #[5040, max_tx_num, 3]；[5040,10,3]
+        self.tx_pos = self.tx_csi[...,:3]   #[5040, max_tx_num, 3]；[5040,10,3]
+        csi_data = self.tx_csi[...,3:] #[5040, max_tx_num, 1+1]；[5040,10,2] (carrier_phase,rss)
+        self.rx_pos = rearrange(self.rx_pos, 'n g c -> (n g) c') #[5040 * max_tx_num, 3]；[50400,3]
+        self.tx_pos = rearrange(self.tx_pos, 'n g c -> (n g) c') #[5040 * max_tx_num, 3]；[50400,3]
+        csi_data = rearrange(csi_data, 'n g c -> (n g) c') #[5040 * max_tx_num, 1+1]；[50400,2] (carrier_phase,rss)
         self.carrier_phase = csi_data[:,0:1]
         self.rss = csi_data[:,1:]
-        self.tx_csi_mask = self.tx_csi_mask.reshape(-1) # shape: [4277 * max_tx_num]; # shape: [42770]
-        self.tx_csi_mask = self.tx_csi_mask.unsqueeze(1).repeat(1, 2) # shape: [4277 * max_tx_num, 2]; # shape: [42770,2]
+        self.tx_csi_mask = self.tx_csi_mask.reshape(-1) # shape: [5040 * max_tx_num]; # shape: [50400]
+        self.tx_csi_mask = self.tx_csi_mask.unsqueeze(1).repeat(1, 2) # shape: [5040 * max_tx_num, 2]; # shape: [50400,2]
 
         #normlize
-        self.carrier_phase = self.normalize_carrier_phase(self.carrier_phase) #[4277 * max_tx_num, 1]；[42770,1] 
-        self.rss = self.normalize_rss(self.rss)                               #[4277 * max_tx_num, 1]；[42770,1] 
-        self.csi = torch.cat([self.rss,self.carrier_phase],dim = -1)          #[4277 * max_tx_num, 2]；[42770,2]
+        self.carrier_phase = self.normalize_carrier_phase(self.carrier_phase) #[5040 * max_tx_num, 1]；[50400,1] 
+        self.rss = self.normalize_rss(self.rss)                               #[5040 * max_tx_num, 1]；[50400,1] 
+        self.csi = torch.cat([self.rss,self.carrier_phase],dim = -1)          #[5040 * max_tx_num, 2]；[50400,2]
         self.rx_pos = self.normalize_rx_pos(self.rx_pos)
         self.tx_pos = self.normalize_tx_pos(self.tx_pos)
 
@@ -463,15 +463,15 @@ class fsc_progressive_dataset(Dataset):
     def load_data(self):
         """准备训练数据"""
         # # 初始化输入输出张量
-        n_samples = self.rx_pos.size(0) #42770
+        n_samples = self.rx_pos.size(0) #50400
         input_size = 3 + 3 * self.alpha_res * self.beta_res + 3    # rx_pos, rays_d, tx_pos; 978
         output_size = 2     # carrier_phase, rss; 2
         nn_inputs = torch.zeros((n_samples, input_size), dtype=torch.float32) # rx_pos, rays_d, tx_pos
         nn_labels = torch.zeros((n_samples, output_size), dtype=torch.float32)# carrier_phase, rss
         
         # 生成射线:原点+方向
-        ray_o, rays_d = self.gen_rays_gateways() # [n_samples, 3], [n_samples, 36*9, 3]; [42770,324,3]
-        rays_d = rearrange(rays_d, 'n g c -> n (g c)') # [n_samples, 36*9*3]; [42770,324*3]
+        ray_o, rays_d = self.gen_rays_gateways() # [n_samples, 3], [n_samples, 36*9, 3]; [50400,324,3]
+        rays_d = rearrange(rays_d, 'n g c -> n (g c)') # [n_samples, 36*9*3]; [50400,324*3]
         
         # 为每个样本准备数据
         for data_counter, idx in tqdm(enumerate(range(n_samples)), total=n_samples): 
@@ -575,7 +575,7 @@ class fsc_dataset(Dataset):
     def __init__(self, datadir, indexdir, scale_worldsize=1):
         super().__init__()
         self.datadir = datadir
-        self.csidata_dir = os.path.join(datadir, 'combined_gnss_data.json')
+        self.csidata_dir = os.path.join(datadir, 'combined_gnss_data_pred_rx_pos.json')
         self.dataset_index = np.loadtxt(indexdir, dtype=int)
         self.beta_res, self.alpha_res = 9, 36  # resolution of rays
         
@@ -594,27 +594,37 @@ class fsc_dataset(Dataset):
             timestamp = list(data_item.keys())[0]
             com_data = data_item[timestamp]
             # 获取当前时间戳下所有的rx_pos
-            for com in com_data:
-                if com['rx_pos']:  # 确保tx_pos不为空
-                    rx_positions_list.append(com['rx_pos'])
+            for i in range(4):
+                if i < len(com_data) and com_data[i]['rx_pos']:  # 确保tx_pos不为空
+                    rx_positions_list.append(com_data[i]['rx_pos'])
+                else:
+                    rx_positions_list.append([0,0,0])
         # 转换为tensor
-        self.rx_pos = torch.tensor(rx_positions_list, dtype=torch.float32)  # shape: [4277, 3];理论是应该len = samples * 4个天线，但是在某些时间戳下有的天线没有数据
+        self.rx_pos = torch.tensor(rx_positions_list, dtype=torch.float32)  # shape: [1260*4,3]=[5040,3];理论是应该len = samples * 4个天线，但是在某些时间戳下有的天线没有数据,强行补0保证数据完整
 
         #-------------提取所有[tx_positions,carrier_phase,rss],对于tx数量不固定使用补0补成一样的，用同纬度mask值标记的方法-------------
         tx_csi_list = []
         for data_item in self.json_index_data:
             timestamp = list(data_item.keys())[0]
             com_data = data_item[timestamp]
-            # 获取当前时间戳下所有的rx_pos
-            for com in com_data:
+            # 获取当前时间戳下所有的tx_pos+rss+carrier_phase
+            for i in range(4):
                 tx_csi_for_one_rx_list = []
-                if com['rx_pos']:  # 确保tx_pos不为空
-                    for tx_csi in com['tx']:
-                        tx_csi_for_one_rx_list.append([tx_csi[i] for i in [1, 2, 3, 6, 7]])# [tx_x, tx_y, tx_z, carrier_phase, rss]
-                    tx_csi_list.append(tx_csi_for_one_rx_list)
+                if i < len(com_data) and com_data[i]['rx_pos']:  # 确保tx_pos不为空
+                    for tx_csi in com_data[i]['tx']:
+                        tx_csi_for_one_rx_list.append([tx_csi[m] for m in [1, 2, 3, 6, 7]])# [tx_x, tx_y, tx_z, carrier_phase, rss]
+                else:
+                    tx_csi_for_one_rx_list.append([])  #对于一个timestamp下不满足4个rx对应数据的，就给缺的rx对应的tx数据补空白？,即只收到一个tx，其
+                tx_csi_list.append(tx_csi_for_one_rx_list)
+        
+        #对于某一秒中不够4个rx对应的数的，在tx_csi_list列表中使其对应的从[[]]-->[],这样的话对应的长度就是0,下面的mask才能算对
+        for n in range(len(tx_csi_list)):
+            if tx_csi_list[n][0] == []:
+                tx_csi_list[n] =[]
+                
         # 找到第二层列表的最大长度和最小长度
         self.max_tx_num = max(len(sublist) for sublist in tx_csi_list) #10
-        self.min_tx_num = min(len(sublist) for sublist in tx_csi_list) #1
+        self.min_tx_num = min(len(sublist) for sublist in tx_csi_list) #0
         # 初始化 mask 列表
         tx_csi_mask_list = []
         # 补齐不够的部分并生成 mask
@@ -625,27 +635,27 @@ class fsc_dataset(Dataset):
                 mask.append(0)
             tx_csi_mask_list.append(mask)
         # 转换为 tensor
-        self.tx_csi = torch.tensor(tx_csi_list, dtype=torch.float32)  # shape: [4277, max_tx_num, 3+1+1]；[4277,10,5]
-        self.tx_csi_mask = torch.tensor(tx_csi_mask_list, dtype=torch.float32)  # shape: [4277, max_tx_num] 用于标记tx_csi的mask，即哪些是真实数据，哪些是补0的数据
+        self.tx_csi = torch.tensor(tx_csi_list, dtype=torch.float32)  # shape: [5040, max_tx_num, 3+1+1]；[5040,10,5]
+        self.tx_csi_mask = torch.tensor(tx_csi_mask_list, dtype=torch.float32)  # shape: [5040, max_tx_num] 用于标记tx_csi的mask，即哪些是真实数据，哪些是补0的数据
 
         #注意，这里的self.tx_csi_mask是用于标记tx_csi的mask，即原本有的数据我们标记为1，补0的数据我们标记为0
         #这样在训练结束的时候我们可以根据这个mask来计算loss，不计算补0的数据的loss
 
-        self.rx_pos = self.rx_pos.unsqueeze(1).repeat(1, self.max_tx_num, 1) #[4277, max_tx_num, 3]；[4277,10,3]
-        self.tx_pos = self.tx_csi[...,:3]   #[4277, max_tx_num, 3]；[4277,10,3]
-        csi_data = self.tx_csi[...,3:] #[4277, max_tx_num, 1+1]；[4277,10,2] (carrier_phase,rss)
-        self.rx_pos = rearrange(self.rx_pos, 'n g c -> (n g) c') #[4277 * max_tx_num, 3]；[42770,3]
-        self.tx_pos = rearrange(self.tx_pos, 'n g c -> (n g) c') #[4277 * max_tx_num, 3]；[42770,3]
-        csi_data = rearrange(csi_data, 'n g c -> (n g) c') #[4277 * max_tx_num, 1+1]；[42770,2] (carrier_phase,rss)
+        self.rx_pos = self.rx_pos.unsqueeze(1).repeat(1, self.max_tx_num, 1) #[5040, max_tx_num, 3]；[5040,10,3]
+        self.tx_pos = self.tx_csi[...,:3]   #[5040, max_tx_num, 3]；[5040,10,3]
+        csi_data = self.tx_csi[...,3:] #[5040, max_tx_num, 1+1]；[5040,10,2] (carrier_phase,rss)
+        self.rx_pos = rearrange(self.rx_pos, 'n g c -> (n g) c') #[5040 * max_tx_num, 3]；[50400,3]
+        self.tx_pos = rearrange(self.tx_pos, 'n g c -> (n g) c') #[5040 * max_tx_num, 3]；[50400,3]
+        csi_data = rearrange(csi_data, 'n g c -> (n g) c') #[5040 * max_tx_num, 1+1]；[50400,2] (carrier_phase,rss)
         self.carrier_phase = csi_data[:,0:1]
         self.rss = csi_data[:,1:]
-        self.tx_csi_mask = self.tx_csi_mask.reshape(-1) # shape: [4277 * max_tx_num]; # shape: [42770]
-        self.tx_csi_mask = self.tx_csi_mask.unsqueeze(1).repeat(1, 2) # shape: [4277 * max_tx_num, 2]; # shape: [42770,2]
+        self.tx_csi_mask = self.tx_csi_mask.reshape(-1) # shape: [5040 * max_tx_num]; # shape: [50400]
+        self.tx_csi_mask = self.tx_csi_mask.unsqueeze(1).repeat(1, 2) # shape: [5040 * max_tx_num, 2]; # shape: [50400,2]
 
         #normlize
-        self.carrier_phase = self.normalize_carrier_phase(self.carrier_phase) #[4277 * max_tx_num, 1]；[42770,1] 
-        self.rss = self.normalize_rss(self.rss)                               #[4277 * max_tx_num, 1]；[42770,1] 
-        self.csi = torch.cat([self.rss,self.carrier_phase],dim = -1)          #[4277 * max_tx_num, 2]；[42770,2]
+        self.carrier_phase = self.normalize_carrier_phase(self.carrier_phase) #[5040 * max_tx_num, 1]；[50400,1] 
+        self.rss = self.normalize_rss(self.rss)                               #[5040 * max_tx_num, 1]；[50400,1] 
+        self.csi = torch.cat([self.rss,self.carrier_phase],dim = -1)          #[5040 * max_tx_num, 2]；[50400,2]
         self.rx_pos = self.normalize_rx_pos(self.rx_pos)
         self.tx_pos = self.normalize_tx_pos(self.tx_pos)
 
@@ -655,15 +665,15 @@ class fsc_dataset(Dataset):
     def load_data(self):
         """准备训练数据"""
         # # 初始化输入输出张量
-        n_samples = self.rx_pos.size(0) #42770
+        n_samples = self.rx_pos.size(0) #50400
         input_size = 3 + 3 * self.alpha_res * self.beta_res + 3    # rx_pos, rays_d, tx_pos; 978
         output_size = 2     # carrier_phase, rss; 2
         nn_inputs = torch.zeros((n_samples, input_size), dtype=torch.float32) # rx_pos, rays_d, tx_pos
         nn_labels = torch.zeros((n_samples, output_size), dtype=torch.float32)# carrier_phase, rss
         
         # 生成射线:原点+方向
-        ray_o, rays_d = self.gen_rays_gateways() # [n_samples, 3], [n_samples, 36*9, 3]; [42770,324,3]
-        rays_d = rearrange(rays_d, 'n g c -> n (g c)') # [n_samples, 36*9*3]; [42770,324*3]
+        ray_o, rays_d = self.gen_rays_gateways() # [n_samples, 3], [n_samples, 36*9, 3]; [50400,324,3]
+        rays_d = rearrange(rays_d, 'n g c -> n (g c)') # [n_samples, 36*9*3]; [50400,324*3]
         
         # 为每个样本准备数据
         for data_counter, idx in tqdm(enumerate(range(n_samples)), total=n_samples): 

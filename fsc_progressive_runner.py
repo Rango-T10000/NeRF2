@@ -71,6 +71,7 @@ class NeRF2_Runner():
 
         ## Train Settings
         self.current_iteration = 1
+        self.current_epoch = 1
         if kwargs_train['load_ckpt'] or mode == 'test':
             self.load_checkpoints()
         self.batch_size = kwargs_train['batch_size']
@@ -142,79 +143,76 @@ class NeRF2_Runner():
     def train(self):
         """train the model
         """
-        self.logger.info("Start training. Current Iteration:%d", self.current_iteration)
-        while self.current_iteration <= self.total_iterations:
-            with tqdm(total=len(self.train_iter), desc=f"Iteration {self.current_iteration}/{self.total_iterations}") as pbar: #显示进度条
+        self.logger.info("Start training. Current epoch:%d", self.current_epoch)
+        if self.dataset_type == 'fsc_progressive':
+            for scene_id in range(self.num_scenes): #每次用一个scene中的前10s数据训练,后5s数据val；self.num_scenes数就是我的epoch数
+                # print(f"Training scene {scene_id + 1}/{self.num_scenes}...")
+                self.logger.info(f"Training scene {scene_id + 1}/{self.num_scenes}...")
 
-                if self.dataset_type == 'fsc_progressive':
-                    for scene_id in range(self.num_scenes): #每次用一个scene中的前10s数据训练,后5s数据val
-                        # print(f"Training scene {scene_id + 1}/{self.num_scenes}...")
-                        self.logger.info(f"Training scene {scene_id + 1}/{self.num_scenes}...")
+                # **1. 只加载当前 scene 的前 10s 训练数据**
+                train_dataset = self.dataset(self.datadir, self.train_index, self.scale_worldsize, scene_id)
+                train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
 
+                # **2. 训练当前 scene**
+                self.nerf2_network.train()
+                with tqdm(total=len(self.num_scenes * self.total_iterations), desc=f"Iteration {self.current_iteration}/{self.num_scenes * self.total_iterations}") as pbar: #显示进度条
+                    for iter in range(self.total_iterations):  
+                        for train_input, train_label, mask in train_loader:
+                            
+                            output = model(train_input)
+                            loss = criterion(output, train_label)
 
-                        # **1. 只加载当前 scene 的前 10s 训练数据**
-                        train_dataset = self.dataset(self.datadir, self.train_index, self.scale_worldsize, scene_id)
-                        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
+                            self.optimizer.zero_grad()
+                            loss.backward()
+                            self.optimizer.step()
+                            self.cosine_scheduler.step()
+                            self.current_iteration += 1
 
-                        # **2. 训练当前 scene**
-                        self.nerf2_network.train()
-                        for iter in range(self.total_iterations):  
-                            if self.current_iteration > self.total_iterations:
-                                break
-                            for train_input, train_label, mask in train_loader:
-                                
-                                output = model(train_input)
-                                loss = criterion(output, train_label)
-
-                                self.optimizer.zero_grad()
-                                loss.backward()
-                                self.optimizer.step()
-                                self.cosine_scheduler.step()
-                                self.current_iteration += 1
+                self.current_epoch += 1
 
 
-                        # **3. 评估当前 scene（使用后 5s 数据）**
-                        val_data = train_dataset.json_test_data  # 5s 评估数据
-                        val_loader = DataLoader(val_data, batch_size=self.batch_size, shuffle=False)  
+                # **3. 评估当前 scene（使用后 5s 数据）**
+                val_data = train_dataset.json_test_data  # 5s 评估数据
+                val_loader = DataLoader(val_data, batch_size=self.batch_size, shuffle=False)  
 
-                        self.nerf2_network.eval()
-                        val_loss = 0
-                        with torch.no_grad():
-                            for val_sample in val_loader:
-                                val_input, val_label, val_mask = val_sample['input'], val_sample['label'], val_sample.get('mask', None)
-                                val_output = model(val_input)
-                                val_loss += criterion(val_output, val_label).item()
+                self.nerf2_network.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    for val_sample in val_loader:
+                        val_input, val_label, val_mask = val_sample['input'], val_sample['label'], val_sample.get('mask', None)
+                        val_output = model(val_input)
+                        val_loss += criterion(val_output, val_label).item()
 
-                        print(f"Scene {scene_id} Val Loss: {val_loss / len(val_loader)}")
+                print(f"Scene {scene_id} Val Loss: {val_loss / len(val_loader)}")
 
-                        # 进入下一个 scene
-                        if scene_id + 1 < self.num_scenes:
-                            train_dataset.set_scene(scene_id + 1)  # 更新数据集
+                # 进入下一个 scene
+                if scene_id + 1 < self.num_scenes:
+                    train_dataset.set_scene(scene_id + 1)  # 更新数据集
 
 #---------------------------------------------
-                    for train_input, train_label, mask in self.train_iter:
-                        if self.current_iteration > self.total_iterations:
-                            break
-                        train_input, train_label, mask = train_input.to(self.devices), train_label.to(self.devices), mask.to(self.devices)
-                        rays_o, rays_d, tx_o = train_input[:, :3], train_input[:,3:3+9*36*3], train_input[:, 3+9*36*3:]
-                        predict = self.renderer.render_fsc(tx_o, rays_o, rays_d) #[batchsize,2]
-                        predict_csi = mask * predict
-                        loss = sig2mse(predict_csi, train_label)
+            for train_input, train_label, mask in self.train_iter:
+                if self.current_iteration > self.total_iterations:
+                    break
+                train_input, train_label, mask = train_input.to(self.devices), train_label.to(self.devices), mask.to(self.devices)
+                rays_o, rays_d, tx_o = train_input[:, :3], train_input[:,3:3+9*36*3], train_input[:, 3+9*36*3:]
+                predict = self.renderer.render_fsc(tx_o, rays_o, rays_d) #[batchsize,2]
+                predict_csi = mask * predict
+                loss = sig2mse(predict_csi, train_label)
 
-                        self.optimizer.zero_grad()
-                        loss.backward()
-                        self.optimizer.step()
-                        self.cosine_scheduler.step()
-                        self.current_iteration += 1
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                self.cosine_scheduler.step()
+                self.current_iteration += 1
 
-                        self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
-                        pbar.update(1)
-                        pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
-                        pbar.set_postfix_str('loss = {:.6f}, lr = {:.6f}'.format(loss.item(), self.optimizer.param_groups[0]['lr']))
+                self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
+                pbar.update(1)
+                pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
+                pbar.set_postfix_str('loss = {:.6f}, lr = {:.6f}'.format(loss.item(), self.optimizer.param_groups[0]['lr']))
 
-                        if self.current_iteration % self.save_freq == 0:
-                            ckptname = self.save_checkpoint()
-                            pbar.write('Saved checkpoints at {}'.format(ckptname))     
+                if self.current_iteration % self.save_freq == 0:
+                    ckptname = self.save_checkpoint()
+                    pbar.write('Saved checkpoints at {}'.format(ckptname))     
                 else:
                     break           
 

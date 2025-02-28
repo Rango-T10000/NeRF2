@@ -340,7 +340,7 @@ class Renderer_fsc(Renderer):
 
         Parameters
         ----------
-        tx_o: tensor. [batchsize, 30]. 10个tx的位置[x1,y1,z1,x2,y2,z2,...,x10,y10,z10]
+        tx_o: tensor. [batchsize, 3]. tx的位置[x,y,z]
         rays_o : tensor. [batchsize, 3]. The origin of rays
         rays_d : tensor. [batchsize, 9x36x3]. The direction of rays
         """

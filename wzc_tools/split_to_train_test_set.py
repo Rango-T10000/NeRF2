@@ -6,7 +6,7 @@ def load_data(file_path):
     with open(file_path, 'r') as f:
         return json.load(f)
 
-def split_into_scenes(data, scene_length=15, num_scenes=92):  #scene_length=25, num_scenes=55
+def split_into_scenes(data, scene_length=11, num_scenes=128):  #scene_length=25, num_scenes=55
     """将数据划分为场景"""
     # 只取需要的数据长度
     required_length = scene_length * num_scenes
@@ -21,7 +21,7 @@ def split_into_scenes(data, scene_length=15, num_scenes=92):  #scene_length=25, 
     
     return scenes
 
-def create_train_test_sets(scenes, train_samples=10, test_samples=5): #train_samples=20, test_samples=5
+def create_train_test_sets(scenes, train_samples=10, test_samples=1): #train_samples=20, test_samples=5
     """从每个场景中创建训练集和测试集，同时返回索引"""
     train_set = []
     test_set = []
@@ -30,7 +30,7 @@ def create_train_test_sets(scenes, train_samples=10, test_samples=5): #train_sam
     
     for scene_idx, scene in enumerate(scenes):
         # 计算场景的基础索引
-        base_idx = scene_idx * 15 #scene_length=25
+        base_idx = scene_idx * 11 #scene_length=25
         
         # 训练集
         train_set.extend(scene[:train_samples])
@@ -58,11 +58,11 @@ def save_indices(indices, file_path):
 
 def main():
     # 文件路径
-    input_file = 'fsc_data/combined_gnss_data.json'
-    train_output = 'fsc_data/train_set.json'
-    test_output = 'fsc_data/test_set.json'
-    train_indices_output = 'fsc_data/train_index.txt'
-    test_indices_output = 'fsc_data/test_index.txt'
+    input_file = 'fsc_data/pred_traj_data/combined_gnss_data_pred_rx_pos.json'
+    train_output = 'fsc_data/pred_traj_data/train_set.json'
+    test_output = 'fsc_data/pred_traj_data/test_set.json'
+    train_indices_output = 'fsc_data/pred_traj_data/train_index.txt'
+    test_indices_output = 'fsc_data/pred_traj_data/test_index.txt'
     
     # 加载数据
     data = load_data(input_file)

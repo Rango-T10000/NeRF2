@@ -1,7 +1,7 @@
 import json
 
 # 定义文件路径
-file_path = 'fsc_data/train_set.json'
+file_path = 'fsc_data/pred_traj_data/combined_gnss_data_pred_rx_pos.json'
 
 # 读取 .pkl 文件
 with open(file_path, 'r') as file:

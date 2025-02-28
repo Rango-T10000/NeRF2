@@ -24,6 +24,8 @@ from model import *
 from renderer import renderer_dict
 from utils.data_painter import paint_spectrum_compare
 from utils.logger import logger_config
+from torch.utils.data import BatchSampler, SequentialSampler
+from itertools import islice
 
 
 class NeRF2_Runner():
@@ -74,8 +76,11 @@ class NeRF2_Runner():
         if kwargs_train['load_ckpt'] or mode == 'test':
             self.load_checkpoints()
         self.batch_size = kwargs_train['batch_size']
+        self.batch_size_train = kwargs_train['batch_size_train']
+        self.batch_size_test = kwargs_train['batch_size_test']
         self.total_iterations = kwargs_train['total_iterations']
         self.save_freq = kwargs_train['save_freq']
+        self.val_freq = kwargs_train['val_freq']
 
         ## Dataset
         dataset = dataset_dict[dataset_type]  #这里决定是dataset是dataloader.py中的Class中的那一个实例化
@@ -88,10 +93,18 @@ class NeRF2_Runner():
         self.train_set = dataset(self.datadir, train_index, self.scale_worldsize)
         self.logger.info("Loading test set...")
         self.test_set = dataset(self.datadir, test_index, self.scale_worldsize)
+        batch_sampler = BatchSampler(SequentialSampler(self.test_set), self.batch_size_test, drop_last=False)
 
-        self.train_iter = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=0)
-        self.test_iter = DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=0)
+
+        self.train_iter = DataLoader(self.train_set, batch_size=self.batch_size_train, shuffle=False, num_workers=0)  #不shuffle,强制安按照我的场景去划分
+        # self.test_iter = DataLoader(self.test_set, batch_size=self.batch_size_test, shuffle=False, num_workers=0)
+        self.test_iter = DataLoader(self.test_set, batch_sampler=batch_sampler)
         self.logger.info("Train set size:%d, Test set size:%d", len(self.train_set), len(self.test_set))
+
+
+    def get_test_batch(self, dataloader, idx):
+        """从 dataloader 中获取指定 batch"""
+        return next(islice(dataloader, idx, None), None)
 
 
     def load_checkpoints(self):
@@ -116,6 +129,7 @@ class NeRF2_Runner():
     def save_checkpoint(self):
         
         ckptsdir = os.path.join(self.logdir, self.expname, 'ckpts')
+        os.makedirs(ckptsdir, exist_ok=True)
         model_lst = [x for x in sorted(os.listdir(ckptsdir)) if x.endswith('.tar')]
         if len(model_lst) > 2:
             os.remove(ckptsdir + '/%s' % model_lst[0])
@@ -151,8 +165,16 @@ class NeRF2_Runner():
                         loss.backward()
                         self.optimizer.step()
                         self.cosine_scheduler.step()
-                        self.current_iteration += 1
 
+                        #间隔固定的val_freq进行test
+                        if self.current_iteration % self.val_freq == 0:
+                            batch_idx = self.current_iteration // self.val_freq - 1
+                            test_input, test_label, mask = self.get_test_batch(self.test_iter, batch_idx) #从test samples取第 self.current_iteration // self.val_freq 个 batch的数据
+                            if test_input is not None:
+                                self.eval_network_fsc_2(test_input, test_label, mask, batch_idx)
+
+
+                        self.current_iteration += 1 #iter数量+1
                         self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
                         pbar.update(1)
                         pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
@@ -161,6 +183,8 @@ class NeRF2_Runner():
                         if self.current_iteration % self.save_freq == 0:
                             ckptname = self.save_checkpoint()
                             pbar.write('Saved checkpoints at {}'.format(ckptname))
+
+
                 elif self.dataset_type == 'fsc_progressive':
                     for train_input, train_label, mask in self.train_iter:
                         if self.current_iteration > self.total_iterations:
@@ -351,12 +375,12 @@ class NeRF2_Runner():
         valid_indices = (all_gt_csi != 0).any(dim=1)  # 任何一列不为 0 的数据都是有效的
         valid_pred_csi = all_pred_csi[valid_indices]
         valid_gt_csi = all_gt_csi[valid_indices]        
-        rss_mse, phase_mse, total_error = fsc_evaluate_2(valid_pred_csi, valid_gt_csi)
+        rss_mse, phase_mse, total_error = fsc_evaluate(valid_pred_csi, valid_gt_csi)
 
         # valid_pred_csi = valid_pred_csi[:,0:1] * torch.exp(1j * valid_pred_csi[:,1:2])
         # valid_gt_csi = valid_gt_csi[:,0:1] * torch.exp(1j * valid_gt_csi[:,1:2])
 
-        snr = csi2snr_2(valid_pred_csi, valid_gt_csi)
+        snr = fsc_csi2snr(valid_pred_csi, valid_gt_csi)
         rss_acc, phase_acc = fsc_accuracy(valid_pred_csi, valid_gt_csi).unbind(dim=1)  # 分别获取 RSS 和 Carrier Phase 的准确率
 
         self.logger.info("Median snr:%.2f", torch.median(snr))
@@ -386,7 +410,76 @@ class NeRF2_Runner():
 
         print("rss_acc shape:", rss_acc.shape)  # (4086,)  # 解绑后每列变为 1D
         print("phase_acc shape:", phase_acc.shape)  # (4086,)
-        
+
+
+    def eval_network_fsc_2(self, test_input, test_label, mask, batch_idx):
+        """test the model and save predicted fsc_csi values to a file
+        """
+        self.logger.info("--------------Eval scenes: %d ---------------", batch_idx + 1)
+        self.nerf2_network.eval()
+        with torch.no_grad(): 
+            test_input, test_label, mask = test_input.to(self.devices), test_label.to(self.devices), mask.to(self.devices)
+            rays_o, rays_d, tx_o = test_input[:, :3], test_input[:,3:3+9*36*3], test_input[:, 3+9*36*3:]
+            predict = self.renderer.render_fsc(tx_o, rays_o, rays_d) #[batchsize,2]
+            predict_csi = mask * predict #[batchsize,2]
+            gt_csi = test_label
+
+            #把norm的结果也存下来
+            predict_csi_norm = predict_csi
+            gt_csi_norm = gt_csi
+
+            #denorm
+            predict_csi[:,0:1] = self.test_set.denormalize_rss(predict_csi[:,0:1])   #这里denorm了，就知道预测的真正结果
+            gt_csi[:,0:1] = self.test_set.denormalize_rss(gt_csi[:,0:1])               
+            predict_csi[:,1:2] = self.test_set.denormalize_carrier_phase(predict_csi[:,1:2])   #这里denorm了，就知道预测的真正结果
+            gt_csi[:,1:2] = self.test_set.denormalize_carrier_phase(gt_csi[:,1:2])
+
+
+        # 仅保留有效数据
+        valid_indices = (gt_csi != 0).any(dim=1)  # 任何一列不为 0 的数据都是有效的
+        valid_pred_csi = predict_csi[valid_indices]
+        valid_gt_csi = gt_csi[valid_indices]
+        valid_pred_csi_norm = predict_csi_norm[valid_indices]
+        valid_gt_csi_norm = gt_csi_norm[valid_indices]
+
+        #pred和gt送入指标评估
+        snr = fsc_csi2snr(valid_pred_csi, valid_gt_csi)                                # 用pred和gt去求snr
+        rss_acc, phase_acc = fsc_accuracy(valid_pred_csi, valid_gt_csi).unbind(dim=1)  # 分别获取 RSS 和 Carrier Phase 的准确率
+        rss_error, phase_error, total_error = fsc_relative_error(valid_pred_csi_norm, valid_gt_csi_norm) # 用norm完的（其实计算相对误差了也可不用norm完的），即量纲同一个的去计算 相对误差error
+
+        self.logger.info("Median snr:%.2f", torch.median(snr))
+        self.logger.info("Median rss_acc:%.2f", torch.median(rss_acc))
+        self.logger.info("Median phase_acc:%.2f", torch.median(phase_acc))
+        self.logger.info("rss_error:%.2f", rss_error)
+        self.logger.info("phase_error:%.2f", phase_error)
+        self.logger.info("total_error:%.2f", total_error)
+
+
+        results_dir = os.path.join(self.logdir, self.expname, "results")
+        os.makedirs(results_dir, exist_ok=True)
+        result_filename = os.path.join(results_dir, f"result_{batch_idx+1}.mat")
+        scio.savemat(result_filename, {'pred_csi': valid_pred_csi.cpu().numpy(),
+                                        'gt_csi': valid_gt_csi.cpu().numpy(),
+                                        'pred_csi_norm': predict_csi_norm.cpu().numpy(),
+                                        'gt_csi_norm': gt_csi_norm.cpu().numpy(),
+                                        'snr': snr.cpu().numpy(),
+                                        'rss_acc': rss_acc.cpu().numpy(),
+                                        'phase_acc': phase_acc.cpu().numpy(),
+                                        'rss_error': rss_error.cpu().numpy(),
+                                        'phase_error': phase_error.cpu().numpy(),
+                                        'total_error': total_error.cpu().numpy(),
+                                    })
+        # print("valid_pred_csi shape:", valid_pred_csi.shape)  # (4086, 2)
+        # print("valid_gt_csi shape:", valid_gt_csi.shape)  # (4086, 2)
+
+        # print("rss_mse shape:", rss_mse.shape)  # (4086, 1)  # 均方误差
+        # print("phase_mse shape:", phase_mse.shape)  # (4086, 1)
+        # print("total_error shape:", total_error.shape)  # (4086, 1)
+
+        # print("snr shape:", snr.shape)  # (4086, 1)  # 信噪比
+
+        # print("rss_acc shape:", rss_acc.shape)  # (4086,)  # 解绑后每列变为 1D
+        # print("phase_acc shape:", phase_acc.shape)  # (4086,)
 
 
 

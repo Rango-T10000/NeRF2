@@ -15,12 +15,14 @@ csi2snr = lambda x, y: -10 * torch.log10(
     torch.norm(y, dim=(1, 2)) ** 2
 )
 
-csi2snr_2 = lambda x, y: -10 * torch.log10(
+
+#---------fsc的snr计算函数-----------
+fsc_csi2snr = lambda x, y: -10 * torch.log10(
     torch.norm(x - y, dim=(1)) ** 2 /
     torch.norm(y, dim=(1)) ** 2
 )
 
-#---------计算rss和carrier phase的预测误差---------
+#---------计算rss和carrier phase的预测与gt的MSE---------
 fsc_evaluate = lambda pred, gt: (
     torch.mean((pred[:, 0:1] - gt[:, 0:1]) ** 2, dim=1, keepdim=True),  # RSS MSE (9603, 1)
     torch.mean((torch.remainder(pred[:, 1:2] - gt[:, 1:2] + torch.pi, 2 * torch.pi) - torch.pi) ** 2, dim=1, keepdim=True),  # Carrier Phase MSE (9603, 1)
@@ -28,18 +30,13 @@ fsc_evaluate = lambda pred, gt: (
     0.5 * torch.mean((torch.remainder(pred[:, 1:2] - gt[:, 1:2] + torch.pi, 2 * torch.pi) - torch.pi) ** 2, dim=1, keepdim=True)  # Total Error (9603, 1)
 )
 
-#均方误差：
-# fsc_evaluate_2 = lambda pred, gt: (
-#     torch.mean((pred[:, 0] - gt[:, 0]) ** 2),  # RSS MSE,返回是标量torch.Size([])
-#     torch.mean((torch.remainder(pred[:, 1] - gt[:, 1] + torch.pi, 2 * torch.pi) - torch.pi) ** 2),  # Carrier Phase MSE返回是标量torch.Size([])
-#     0.5 * torch.mean((pred[:, 0] - gt[:, 0]) ** 2) + 
-#     0.5 * torch.mean((torch.remainder(pred[:, 1] - gt[:, 1] + torch.pi, 2 * torch.pi) - torch.pi) ** 2)  # Total Error返回是标量torch.Size([])
-# )
-fsc_evaluate_2 = lambda pred, gt: (
-    torch.mean((pred[:, 0] - gt[:, 0]) ** 2),  # RSS MSE,返回是标量torch.Size([])
-    torch.mean((torch.remainder(pred[:, 1] - gt[:, 1] + 0.5, 1.0) - 0.5) ** 2),  # Carrier Phase MSE返回是标量torch.Size([])
-    0.5 * torch.mean((pred[:, 0] - gt[:, 0]) ** 2) + 
-    0.5 * torch.mean((torch.remainder(pred[:, 1] - gt[:, 1] + 0.5, 1.0) - 0.5) ** 2)  # Total Error返回是标量torch.Size([])
+
+#--------计算pred和gt的相对误差--------
+fsc_relative_error = lambda pred, gt: (
+    torch.mean(torch.abs(pred[:, 0] - gt[:, 0]) / torch.abs(gt[:, 0])),  # RSS relative error,返回是标量torch.Size([])
+    torch.mean(torch.abs(torch.remainder(pred[:, 1] - gt[:, 1] + 0.5, 1.0) - 0.5) / torch.abs(gt[:, 1])),  # Carrier Phase relative error返回是标量torch.Size([])
+    0.5 * torch.mean(torch.abs(pred[:, 0] - gt[:, 0]) / torch.abs(gt[:, 0])) + 
+    0.5 * torch.mean(torch.abs(torch.remainder(pred[:, 1] - gt[:, 1] + 0.5, 1.0) - 0.5) / torch.abs(gt[:, 1]))  # Total relative error返回是标量torch.Size([])
 )
 
 #accuracy
@@ -205,15 +202,6 @@ class NeRF2(nn.Module):
             x = F.relu(layer(x))
             if i in self.skips:
                 x = torch.cat([pts, x], -1)
-        
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            print("NaN or Inf detected in attn:")
-            print(x)   
-
-        # 在调用位置编码前检查 pts 是否为 NaN 或 Inf
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            print("NaN or Inf detected in attn:")
-            print(x)    
 
         attn = self.attenuation_output(x)    # (batch_size*36*9*n_points, 2); (batch_size*36*9*n_points, attn_output_dims),这个输出纬度根据数据集以及任务的不同在配置文件修改
         feature = self.feature_layer(x)      # (batch_size*36*9*n_points, W); (batch_size*36*9*n_points, 256)
