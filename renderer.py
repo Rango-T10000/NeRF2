@@ -141,8 +141,6 @@ class Renderer_spectrum(Renderer):
         return receive_signal
 
 
-
-
 class Renderer_RSSI(Renderer):
     """Renderer for RSSI (integral from all directions)
     """
@@ -230,8 +228,6 @@ class Renderer_RSSI(Renderer):
         return abs(recv_signal)
 
 
-
-
 class Renderer_CSI(Renderer):
     """Renderer for CSI (integral from all directions)
     """
@@ -315,8 +311,6 @@ class Renderer_CSI(Renderer):
         recv_signal = torch.sum(recv_signal, 1)                           # integral along direction [batchsize, 26]
 
         return recv_signal
-
-
 
 
 class Renderer_fsc(Renderer):
@@ -408,8 +402,109 @@ class Renderer_fsc(Renderer):
         return torch.stack([rss, carrier_phase], dim=-1)  # [batchsize, 2]
 
 
+class Renderer_fsc_4rx(Renderer):
+    """Renderer for CSI (integral from all directions)
+    """
 
-renderer_dict = {"spectrum": Renderer_spectrum, "rssi": Renderer_RSSI, "csi": Renderer_CSI, "fsc": Renderer_fsc}
+    def __init__(self, networks_fn, **kwargs) -> None:
+        """
+        Parameters
+        -----------------
+        near : float. The near bound of the rays
+        far : float. The far bound of the rays
+        n_samples: int. num of samples per ray
+        """
+        super().__init__(networks_fn, **kwargs)
+
+
+
+    def render_fsc_4rx(self, tx_o, rays_o, rays_d):
+        """render the RSSI for each gateway.
+
+        Parameters
+        ----------
+        tx_o: tensor. [batchsize, 4, 3]. 4个rx对应的tx的位置[x,y,z]
+        rays_o : tensor. [batchsize, 4, 3]. The origin of rays
+        rays_d : tensor. [batchsize, 4, 9x36x3]. The direction of rays
+        """
+        
+        # 重新排列rays_d的维度
+        rays_d = rearrange(rays_d, 'b r (v d) -> b r v d', d=3)    # [bs, 4, 9x36, 3]
+        batchsize, n_rx, viewsize, _ = rays_d.shape
+        
+        # 扩展rays_o和tx_o到与rays_d相同的view size
+        rays_o = repeat(rays_o, 'b r d -> b r v d', v=viewsize)    # [bs, 4, 9x36, 3]
+        tx_o = repeat(tx_o, 'b r d -> b r v d', v=viewsize)        # [bs, 4, 9x36, 3]
+
+        # 采样点
+        pts, t_vals = self.sample_points(rays_o, rays_d) # pts: [bs, 4, 9x36, pts, 3]; t_vals: [bs, 4, 9x36, pts]
+        
+        # 扩展views和tx_o到采样点维度
+        views = repeat(rays_d, 'b r v d -> b r v p d', p=self.n_samples)  # [bs, 4, 9x36, pts, 3]
+        tx_o = repeat(tx_o, 'b r v d -> b r v p d', p=self.n_samples)    # [bs, 4, 9x36, pts, 3]
+
+        # 处理每个rx的数据
+        # 方案1：保持4个rx的维度
+        raw = self.network_fn(pts, views, tx_o)    # [bs, 4, 9x36, pts, 4]
+        recv_signal = self.raw2outputs_signal(raw, t_vals, rays_d)  # [bs, 4, 2]
+        
+        return recv_signal
+
+
+    def raw2outputs_signal(self, raw, r_vals, rays_d):
+        """Transforms model's predictions to semantically meaningful values.
+
+        Parameters
+        ----------
+        raw : [batchsize, 4, chunks:324, n_samples, 4]. Prediction from model.
+        r_vals : [batchsize, 4, chunks:324, n_samples]. Integration distance.
+        rays_d : [batchsize, 4, chunks:324, 3]. Direction of each ray
+
+        Return:
+        ----------
+        receive_signal : [batchsize, 4, 2]. 4个rx的csi预测值
+        """
+        wavelength = sc.c / 2.4e9
+        raw2phase = lambda raw, dists: raw + 2*np.pi*dists/wavelength
+        raw2amp = lambda raw, dists: -raw*dists
+
+        # 计算距离，保持4的维度
+        dists = r_vals[...,1:] - r_vals[...,:-1]  # [bs, 4, 324, pts-1]
+        dists = torch.cat([dists, torch.Tensor([1e10]).cuda().expand(dists[...,:1].shape)], -1)  # [bs, 4, 324, pts]
+        dists = dists * torch.norm(rays_d[...,None,:], dim=-1)  # [bs, 4, 324, pts]
+
+        # 分离raw的四个分量
+        att_a, att_p, s_a, s_p = raw[...,0], raw[...,1], raw[...,2], raw[...,3]  # 每个都是 [bs, 4, 324, pts]
+        att_p, s_p = torch.sigmoid(att_p)*np.pi*2-np.pi, torch.sigmoid(s_p)*np.pi*2-np.pi
+        att_a, s_a = abs(F.leaky_relu(att_a)), abs(F.leaky_relu(s_a))
+
+        amp = raw2amp(att_a, dists)      # [bs, 4, 324, pts]
+        phase = raw2phase(att_p, dists)  # [bs, 4, 324, pts]
+
+        # 计算累积效果
+        amp_i = torch.exp(torch.cumsum(amp, -1))        # [bs, 4, 324, pts]
+        phase_i = torch.exp(1j*torch.cumsum(phase, -1)) # [bs, 4, 324, pts]
+
+        # 路径损耗计算
+        path = torch.cat([r_vals[...,1:], torch.Tensor([1e10]).cuda().expand(r_vals[...,:1].shape)], -1) # [bs, 4, 324, pts]
+        path_loss = wavelength/(4*np.pi)/path  # [bs, 4, 324, pts]
+        
+        # 沿着pts维度求和
+        recv_signal = torch.sum(s_a*torch.exp(1j*s_p)*amp_i*phase_i*path_loss, -1)  # [bs, 4, 324]
+        # 沿着方向维度求和
+        recv_signal = torch.sum(recv_signal, -1)  # [bs, 4]
+
+        # 计算每个rx的RSS和carrier phase
+        rss = torch.abs(recv_signal)         # [bs, 4]
+        carrier_phase = torch.angle(recv_signal)  # [bs, 4]
+
+        # 堆叠RSS和carrier phase
+        return torch.stack([rss, carrier_phase], dim=-1)  # [bs, 4, 2]
+
+
+
+
+renderer_dict = {"spectrum": Renderer_spectrum, "rssi": Renderer_RSSI, "csi": Renderer_CSI, "fsc": Renderer_fsc, "fsc_4rx":Renderer_fsc_4rx}
 
 # 上面这3个类分别对应了3种不同的信号预测任务，分别是spectrum, rssi, csi，其实本质一样就是输入不同，输出都可预测一个复数（幅度+相位）
 # render以及叠加本质是一样的，都是对信号进行积分，但是输入的数据集不一样，所以预处理的代码不同

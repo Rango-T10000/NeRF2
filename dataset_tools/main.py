@@ -24,9 +24,9 @@ if __name__ == '__main__':
 
     #一次性生成极坐标形式的空间谱
     save_path_1 = "dataset_tools/imgs/linear_spectrum_ploar_grid-2.png"
-    save_path_2 = "dataset_tools/imgs/linear_spectrum_ploar_grid-3.png"
+    save_path_2 = "dataset_tools/imgs/linear_spectrum_ploar_grid-4.png"
 
-    sample_phase = [-1.34, -0.865, 0.324, 0.57]  # 替换为你的实际测量值
+    sample_phase = [0.872, 0.895, 0.811, 0.923]  # 替换为你的实际测量值
     worker = Bartlett()
     spectrum = worker.gen_spectrum_linear(sample_phase)
     spectrum = torch.tensor(spectrum)

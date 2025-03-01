@@ -189,8 +189,9 @@ class NeRF2_Runner():
                         if self.current_iteration > self.total_iterations:
                             break
                         train_input, train_label, mask = train_input.to(self.devices), train_label.to(self.devices), mask.to(self.devices)
-                        rays_o, rays_d, tx_o = train_input[:, :3], train_input[:,3:3+9*36*3], train_input[:, 3+9*36*3:]
-                        predict = self.renderer.render_fsc(tx_o, rays_o, rays_d) #[batchsize,2]
+                        rays_o, rays_d, tx_o = train_input[:, :, :3], train_input[:, :, 3:3+9*36*3], train_input[:, :, 3+9*36*3:]
+                        predict = self.renderer.render_fsc_4rx(tx_o, rays_o, rays_d) #[batchsize, 4, 2]
+                        mask = mask[..., None] #[batchsize, 4]---->#[batchsize, 4, 1]广播
                         predict_csi = mask * predict
                         loss = sig2mse(predict_csi, train_label)
 
@@ -427,67 +428,57 @@ class NeRF2_Runner():
         self.nerf2_network.eval()
         with torch.no_grad(): 
             test_input, test_label, mask = test_input.to(self.devices), test_label.to(self.devices), mask.to(self.devices)
-            rays_o, rays_d, tx_o = test_input[:, :3], test_input[:,3:3+9*36*3], test_input[:, 3+9*36*3:]
-            predict = self.renderer.render_fsc(tx_o, rays_o, rays_d) #[batchsize,2]
-            predict_csi = mask * predict #[batchsize,2]
-            gt_csi = test_label
+            rays_o, rays_d, tx_o = test_input[:, :, :3], test_input[:, :, 3:3+9*36*3], test_input[:, :, 3+9*36*3:]
+            predict = self.renderer.render_fsc_4rx(tx_o, rays_o, rays_d) #[batchsize,4,2]
+            predict_csi = mask[..., None] * predict #[batchsize,4,2]
+            gt_csi = test_label #[batchsize,4,2]
 
             #把norm的结果也存下来
-            predict_csi_norm = predict_csi
-            gt_csi_norm = gt_csi
+            predict_csi_norm = predict_csi.clone()
+            gt_csi_norm = gt_csi.clone()
 
-            #denorm
-            predict_csi[:,0:1] = self.test_set.denormalize_rss(predict_csi[:,0:1])   #这里denorm了，就知道预测的真正结果
-            gt_csi[:,0:1] = self.test_set.denormalize_rss(gt_csi[:,0:1])               
-            predict_csi[:,1:2] = self.test_set.denormalize_carrier_phase(predict_csi[:,1:2])   #这里denorm了，就知道预测的真正结果
-            gt_csi[:,1:2] = self.test_set.denormalize_carrier_phase(gt_csi[:,1:2])
+            #denorm - 需要对每个rx分别处理
+            for rx_idx in range(4):
+                predict_csi[:, rx_idx, 0] = self.test_set.denormalize_rss(predict_csi[:, rx_idx, 0])
+                gt_csi[:, rx_idx, 0] = self.test_set.denormalize_rss(gt_csi[:, rx_idx, 0])
+                predict_csi[:, rx_idx, 1] = self.test_set.denormalize_carrier_phase(predict_csi[:, rx_idx, 1])
+                gt_csi[:, rx_idx, 1] = self.test_set.denormalize_carrier_phase(gt_csi[:, rx_idx, 1])
 
+            # 仅保留有效数据
+            # 先在dim=2（RSS和phase维度）上检查
+            valid_indices = (gt_csi != 0).any(dim=2)  # [batchsize, 4]
+            # 再在dim=1（rx维度）上检查
+            valid_indices = valid_indices.any(dim=1)  # [batchsize]
+            
+            valid_pred_csi = predict_csi[valid_indices]
+            valid_gt_csi = gt_csi[valid_indices]
+            valid_pred_csi_norm = predict_csi_norm[valid_indices]
+            valid_gt_csi_norm = gt_csi_norm[valid_indices]
 
-        # 仅保留有效数据
-        valid_indices = (gt_csi != 0).any(dim=1)  # 任何一列不为 0 的数据都是有效的
-        valid_pred_csi = predict_csi[valid_indices]
-        valid_gt_csi = gt_csi[valid_indices]
-        valid_pred_csi_norm = predict_csi_norm[valid_indices]
-        valid_gt_csi_norm = gt_csi_norm[valid_indices]
+            #pred和gt送入指标评估
+            snr = fsc_csi2snr(valid_pred_csi, valid_gt_csi)      # 用pred和gt去求snr：[valid_batchsize, 4]
+            self.logger.info("Median snr:%.2f", torch.median(snr))
 
-        #pred和gt送入指标评估
-        snr = fsc_csi2snr(valid_pred_csi, valid_gt_csi)                                # 用pred和gt去求snr
-        rss_acc, phase_acc = fsc_accuracy(valid_pred_csi, valid_gt_csi).unbind(dim=1)  # 分别获取 RSS 和 Carrier Phase 的准确率
-        rss_error, phase_error, total_error = fsc_relative_error(valid_pred_csi_norm, valid_gt_csi_norm) # 用norm完的（其实计算相对误差了也可不用norm完的），即量纲同一个的去计算 相对误差error
+            results_dir = os.path.join(self.logdir, self.expname, "results")
+            os.makedirs(results_dir, exist_ok=True)
+            result_filename = os.path.join(results_dir, f"result_{batch_idx+1}.mat")
+            scio.savemat(result_filename, {'pred_csi': valid_pred_csi.cpu().numpy(),
+                                            'gt_csi': valid_gt_csi.cpu().numpy(),
+                                            'pred_csi_norm': valid_pred_csi_norm.cpu().numpy(),
+                                            'gt_csi_norm': valid_gt_csi_norm.cpu().numpy(),
+                                            'snr': snr.cpu().numpy()
+                                        })
+            # print("valid_pred_csi shape:", valid_pred_csi.shape)  # (4086, 2)
+            # print("valid_gt_csi shape:", valid_gt_csi.shape)  # (4086, 2)
 
-        self.logger.info("Median snr:%.2f", torch.median(snr))
-        self.logger.info("Median rss_acc:%.2f", torch.median(rss_acc))
-        self.logger.info("Median phase_acc:%.2f", torch.median(phase_acc))
-        self.logger.info("rss_error:%.2f", rss_error)
-        self.logger.info("phase_error:%.2f", phase_error)
-        self.logger.info("total_error:%.2f", total_error)
+            # print("rss_mse shape:", rss_mse.shape)  # (4086, 1)  # 均方误差
+            # print("phase_mse shape:", phase_mse.shape)  # (4086, 1)
+            # print("total_error shape:", total_error.shape)  # (4086, 1)
 
+            # print("snr shape:", snr.shape)  # (4086, 1)  # 信噪比
 
-        results_dir = os.path.join(self.logdir, self.expname, "results")
-        os.makedirs(results_dir, exist_ok=True)
-        result_filename = os.path.join(results_dir, f"result_{batch_idx+1}.mat")
-        scio.savemat(result_filename, {'pred_csi': valid_pred_csi.cpu().numpy(),
-                                        'gt_csi': valid_gt_csi.cpu().numpy(),
-                                        'pred_csi_norm': predict_csi_norm.cpu().numpy(),
-                                        'gt_csi_norm': gt_csi_norm.cpu().numpy(),
-                                        'snr': snr.cpu().numpy(),
-                                        'rss_acc': rss_acc.cpu().numpy(),
-                                        'phase_acc': phase_acc.cpu().numpy(),
-                                        'rss_error': rss_error.cpu().numpy(),
-                                        'phase_error': phase_error.cpu().numpy(),
-                                        'total_error': total_error.cpu().numpy(),
-                                    })
-        # print("valid_pred_csi shape:", valid_pred_csi.shape)  # (4086, 2)
-        # print("valid_gt_csi shape:", valid_gt_csi.shape)  # (4086, 2)
-
-        # print("rss_mse shape:", rss_mse.shape)  # (4086, 1)  # 均方误差
-        # print("phase_mse shape:", phase_mse.shape)  # (4086, 1)
-        # print("total_error shape:", total_error.shape)  # (4086, 1)
-
-        # print("snr shape:", snr.shape)  # (4086, 1)  # 信噪比
-
-        # print("rss_acc shape:", rss_acc.shape)  # (4086,)  # 解绑后每列变为 1D
-        # print("phase_acc shape:", phase_acc.shape)  # (4086,)
+            # print("rss_acc shape:", rss_acc.shape)  # (4086,)  # 解绑后每列变为 1D
+            # print("phase_acc shape:", phase_acc.shape)  # (4086,)
 
 
 

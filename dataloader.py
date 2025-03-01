@@ -490,6 +490,7 @@ class fsc_dataset_4rx(Dataset):
         self.rx_pos = self.rx_pos.permute(0, 2, 1, 3).reshape(-1, 4, 3)  # [12800, 4, 3]
         self.tx_pos = self.tx_pos.permute(0, 2, 1, 3).reshape(-1, 4, 3)  # [12800, 4, 3]
         self.csi = self.csi.permute(0, 2, 1, 3).reshape(-1, 4, 2)  # [12800, 4, 2]
+        self.tx_csi_mask = self.tx_csi_mask.permute(0, 2, 1).reshape(-1, 4)  #[1280, 4, 10]--->[12800, 4] 
 
         # 处理数据
         self.nn_inputs, self.nn_labels = self.load_data()
@@ -601,7 +602,7 @@ class fsc_dataset_4rx(Dataset):
 
     def __getitem__(self, index):
         """修改__getitem__方法来返回包含4个rx的数据"""
-        inputs = self.nn_inputs[index]    # [4, 978]
+        inputs = self.nn_inputs[index]    # [4, 978]，这是一个sample，其实还有batchsize
         labels = self.nn_labels[index]    # [4, 2]
         mask = self.tx_csi_mask[index]    # [4, max_tx_num]
         return inputs, labels, mask

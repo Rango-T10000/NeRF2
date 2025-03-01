@@ -1,17 +1,17 @@
 
 ### Path settings
 path:
-  expname: fsc-exp-progressive_pred_traj_4rx-1
+  expname: fsc-exp-progressive_pred_traj_4rx-2
   datadir: fsc_data/pred_traj_data     #注意dataloader.py中的这里也要改self.csidata_dir = os.path.join(datadir, 'combined_gnss_data_pred_rx_pos.json')
   logdir: logs/fsc/
 
 
 ### rendering settings
 render:
-  mode: 'fsc'
+  mode: 'fsc_4rx'
   near: 0     #在这里去规定场景的大小
   far: 50      #在这里去规定场景的大小，这个就是最大5m范围，这就是文章中的D
-  n_samples: 32
+  n_samples: 64
   scale_worldsize: 1
 
 
@@ -23,14 +23,14 @@ train:
   eta_min: 1e-6
   batch_size: 400  #最好是2的幂，对硬件来说底层存储效率最大化 #先不用这个
 
-  batch_size_train: 400
-  batch_size_test: 40
+  batch_size_train: 10
+  batch_size_test: 10
 
-  total_iterations: 128
+  total_iterations: 1280
   load_ckpt: False
 
   save_freq: 100
-  val_freq: 1
+  val_freq: 10
   report_freq: 100
 
 

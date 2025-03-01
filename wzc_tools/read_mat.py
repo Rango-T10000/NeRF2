@@ -1,7 +1,7 @@
 import scipy.io as scio
 
 # Load the .mat file
-data = scio.loadmat('logs/fsc/fsc-exp-progressive_gt_traj-3/results/result_1.mat')
+data = scio.loadmat('logs/fsc/fsc-exp-progressive_pred_traj_4rx-1/results/result_1.mat')
 
 # Print the keys of the loaded data
 print("Keys in the .mat file:", data.keys())

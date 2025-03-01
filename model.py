@@ -17,10 +17,17 @@ csi2snr = lambda x, y: -10 * torch.log10(
 
 
 #---------fsc的snr计算函数-----------
-fsc_csi2snr = lambda x, y: -10 * torch.log10(
-    torch.norm(x - y, dim=(1)) ** 2 /
-    torch.norm(y, dim=(1)) ** 2
-)
+def fsc_csi2snr(x, y):
+    # 计算每个rx的SNR
+    numerator = torch.norm(x - y, dim=-1) ** 2    # [valid_batchsize, 4]
+    denominator = torch.norm(y, dim=-1) ** 2      # [valid_batchsize, 4]
+    
+    # 处理分母为0的情况
+    valid_mask = (denominator != 0)
+    snr = torch.zeros_like(numerator)
+    snr[valid_mask] = -10 * torch.log10(numerator[valid_mask] / denominator[valid_mask])
+    
+    return snr  # [valid_batchsize, 4]
 
 #---------计算rss和carrier phase的预测与gt的MSE---------
 fsc_evaluate = lambda pred, gt: (
@@ -173,29 +180,72 @@ class NeRF2(nn.Module):
         self.feature_layer = nn.Linear(W, W)
         self.signal_output = nn.Linear(W//2, sig_output_dims)
 
+    #原本的forward用这个
+    # def forward(self, pts, view, tx):
+    #     """forward function of the model
 
+    #     Parameters
+    #     ----------
+    #     pts: [batchsize, n_samples, 3], position of voxels
+    #     view: [batchsize, n_samples, 3], view direction
+    #     tx: [batchsize, n_samples, 3], position of transmitter
+
+    #     Returns
+    #     ----------
+    #     outputs: [batchsize, n_samples, 4].   attn_amp, attn_phase, signal_amp, signal_phase
+    #     """
+    #     # position encoding; #.contiguous() 是为了保证 Tensor 在内存中的连续性，方便 view() 操作
+    #     pts = self.embed_pts_fn(pts).contiguous() # [batchsize, n_samples/points, input_pts_dim], e.g.[batchsize, 64, 3]---->[batchsize, 64, 63]
+    #     view = self.embed_view_fn(view).contiguous()
+    #     tx = self.embed_tx_fn(tx).contiguous()
+
+    #     shape = pts.shape
+    #     pts = pts.view(-1, list(pts.shape)[-1]) # [batchsize*n_samples, input_pts_dim]
+    #     view = view.view(-1, list(view.shape)[-1])
+    #     tx = tx.view(-1, list(tx.shape)[-1])
+
+    #     x = pts
+    #     for i, layer in enumerate(self.attenuation_linears):
+    #         x = F.relu(layer(x))
+    #         if i in self.skips:
+    #             x = torch.cat([pts, x], -1)
+
+    #     attn = self.attenuation_output(x)    # (batch_size*36*9*n_points, 2); (batch_size*36*9*n_points, attn_output_dims),这个输出纬度根据数据集以及任务的不同在配置文件修改
+    #     feature = self.feature_layer(x)      # (batch_size*36*9*n_points, W); (batch_size*36*9*n_points, 256)
+    #     x = torch.cat([feature, view, tx], -1)
+
+    #     for i, layer in enumerate(self.signal_linears):
+    #         x = F.relu(layer(x))
+    #     signal = self.signal_output(x)    #[batch_size*36*9*n_points, 20]; [batch_size*36*9*n_points, sig_output_dims]这个输出纬度根据数据集以及任务的不同在配置文件修改
+    #     outputs = torch.cat([attn, signal], -1).contiguous()    # [batchsize, n_samples, 4]
+    #     return outputs.view(shape[:-1]+outputs.shape[-1:])
+
+    #---------用于fsc_4rx处理的forward---------
     def forward(self, pts, view, tx):
         """forward function of the model
 
         Parameters
         ----------
-        pts: [batchsize, n_samples, 3], position of voxels
-        view: [batchsize, n_samples, 3], view direction
-        tx: [batchsize, n_samples, 3], position of transmitter
+        pts: [batchsize, 4, n_views, n_samples, 3]
+        view: [batchsize, 4, n_views, n_samples, 3]
+        tx: [batchsize, 4, n_views, n_samples, 3] 
 
         Returns
         ----------
-        outputs: [batchsize, n_samples, 4].   attn_amp, attn_phase, signal_amp, signal_phase
+        outputs: [batchsize, 4, 2]
         """
-        # position encoding; #.contiguous() 是为了保证 Tensor 在内存中的连续性，方便 view() 操作
-        pts = self.embed_pts_fn(pts).contiguous() # [batchsize, n_samples/points, input_pts_dim], e.g.[batchsize, 64, 3]---->[batchsize, 64, 63]
-        view = self.embed_view_fn(view).contiguous()
-        tx = self.embed_tx_fn(tx).contiguous()
-
-        shape = pts.shape
-        pts = pts.view(-1, list(pts.shape)[-1]) # [batchsize*n_samples, input_pts_dim]
-        view = view.view(-1, list(view.shape)[-1])
-        tx = tx.view(-1, list(tx.shape)[-1])
+        # 保存原始batch和rx维度
+        batch_size, n_rx, n_views, n_samples = pts.shape[:-1]
+        
+        # position encoding
+        pts = self.embed_pts_fn(pts)    # [bs, 4, 324, 32, 63]
+        view = self.embed_view_fn(view)
+        tx = self.embed_tx_fn(tx)
+        
+        # 重组维度，保持rx维度独立
+        pts = rearrange(pts, 'b r v s d -> (b r) (v s) d')    # [bs*4, 324*32, 63]
+        view = rearrange(view, 'b r v s d -> (b r) (v s) d')
+        tx = rearrange(tx, 'b r v s d -> (b r) (v s) d')
 
         x = pts
         for i, layer in enumerate(self.attenuation_linears):
@@ -203,12 +253,18 @@ class NeRF2(nn.Module):
             if i in self.skips:
                 x = torch.cat([pts, x], -1)
 
-        attn = self.attenuation_output(x)    # (batch_size*36*9*n_points, 2); (batch_size*36*9*n_points, attn_output_dims),这个输出纬度根据数据集以及任务的不同在配置文件修改
-        feature = self.feature_layer(x)      # (batch_size*36*9*n_points, W); (batch_size*36*9*n_points, 256)
+        attn = self.attenuation_output(x)    # [(bs*4), (324*32), 2]
+        feature = self.feature_layer(x)
         x = torch.cat([feature, view, tx], -1)
 
         for i, layer in enumerate(self.signal_linears):
             x = F.relu(layer(x))
-        signal = self.signal_output(x)    #[batch_size*36*9*n_points, 20]; [batch_size*36*9*n_points, sig_output_dims]这个输出纬度根据数据集以及任务的不同在配置文件修改
-        outputs = torch.cat([attn, signal], -1).contiguous()    # [batchsize, n_samples, 4]
-        return outputs.view(shape[:-1]+outputs.shape[-1:])
+        signal = self.signal_output(x)    # [(bs*4), (324*32), 2]
+        
+        outputs = torch.cat([attn, signal], -1)    # [(bs*4), (324*32), 4]
+        
+        # 重组回原始维度并进行必要的聚合操作
+        outputs = rearrange(outputs, '(b r) (v s) d -> b r v s d', 
+                        b=batch_size, r=n_rx, v = n_views, s = n_samples)    # [bs, 4, 324, 32, 4]
+        
+        return outputs
